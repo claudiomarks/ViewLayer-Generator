@@ -11,7 +11,7 @@ from bpy.props import (
 bl_info = {
     "name": "ViewLayer Generator",
     "author": "Claudin",
-    "version": (1, 0),
+    "version": (1, 1),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > View Layer Generator",
     "description": "Gera viewlayers a partir de collections e configura passes e AOVs",
@@ -24,6 +24,20 @@ class CollectionItem(PropertyGroup):
 
 # Propriedades para armazenar configurações
 class ViewLayerGeneratorProps(PropertyGroup):
+    # Propriedade para filtrar collections
+    collection_filter: StringProperty(
+        name="Filtro de Collections",
+        description="Filtrar collections por nome",
+        default=""
+    )
+    
+    # Opções de filtro
+    filter_case_sensitive: BoolProperty(
+        name="Case Sensitive",
+        description="Filtro sensível a maiúsculas/minúsculas",
+        default=False
+    )
+    
     # Propriedades para os passes
     use_z: BoolProperty(name="Z", default=False)
     use_mist: BoolProperty(name="Mist", default=False)
@@ -58,6 +72,13 @@ class ViewLayerGeneratorProps(PropertyGroup):
             ('8', "8 Levels", ""),
         ],
         default='2'
+    )
+    
+    # Propriedades para verificar AOVs existentes nos materiais
+    detect_shader_aovs: BoolProperty(
+        name="Detectar AOVs dos Shaders",
+        description="Detectar e usar AOVs já configurados nos shaders",
+        default=False
     )
     
     # Propriedades para AOVs personalizados
@@ -102,6 +123,95 @@ class VIEWLAYER_OT_toggle_collection(Operator):
         return {'FINISHED'}
 
 
+# Operador para selecionar todas as collections visíveis (após filtro)
+class VIEWLAYER_OT_select_all_collections(Operator):
+    bl_idname = "viewlayer.select_all_collections"
+    bl_label = "Selecionar Todas"
+    bl_description = "Selecionar todas as collections visíveis"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    def execute(self, context):
+        scene = context.scene
+        props = scene.viewlayer_generator_props
+        
+        # Obter coleções filtradas
+        filtered_collections = get_filtered_collections(scene, props)
+        
+        # Selecionar todas as coleções filtradas
+        for collection_name in filtered_collections:
+            if collection_name in scene.collection_selection:
+                scene.collection_selection[collection_name].selected = True
+        
+        return {'FINISHED'}
+
+
+# Operador para desselecionar todas as collections
+class VIEWLAYER_OT_deselect_all_collections(Operator):
+    bl_idname = "viewlayer.deselect_all_collections"
+    bl_label = "Desselecionar Todas"
+    bl_description = "Desselecionar todas as collections"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    def execute(self, context):
+        scene = context.scene
+        
+        # Desselecionar todas as coleções
+        for item in scene.collection_selection:
+            item.selected = False
+        
+        return {'FINISHED'}
+
+
+# Operador para detectar AOVs nos shaders
+class VIEWLAYER_OT_detect_shader_aovs(Operator):
+    bl_idname = "viewlayer.detect_shader_aovs"
+    bl_label = "Detectar AOVs nos Shaders"
+    bl_description = "Detectar AOVs configurados nos shaders do projeto"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    def execute(self, context):
+        # Detectar AOVs existentes nos materiais
+        aov_names = set()
+        
+        # Percorrer todos os materiais
+        for material in bpy.data.materials:
+            if material.use_nodes:
+                # Encontrar nós de saída AOV
+                for node in material.node_tree.nodes:
+                    if node.type == 'OUTPUT_AOV':
+                        aov_name = node.name
+                        if aov_name.startswith("AOV "):
+                            aov_name = aov_name[4:]  # Remover o prefixo "AOV "
+                        aov_names.add(aov_name)
+        
+        # Exibir informações sobre os AOVs encontrados
+        if aov_names:
+            self.report({'INFO'}, f"Encontrados {len(aov_names)} AOVs nos materiais: {', '.join(aov_names)}")
+        else:
+            self.report({'INFO'}, "Nenhum AOV encontrado nos materiais.")
+            
+        return {'FINISHED'}
+
+
+# Função auxiliar para filtrar coleções
+def get_filtered_collections(scene, props):
+    filter_text = props.collection_filter
+    case_sensitive = props.filter_case_sensitive
+    
+    if not filter_text:
+        # Se não houver filtro, retornar todas as coleções
+        return [item.name for item in scene.collection_selection]
+    
+    # Aplicar filtro
+    if case_sensitive:
+        return [item.name for item in scene.collection_selection 
+                if filter_text in item.name]
+    else:
+        filter_text = filter_text.lower()
+        return [item.name for item in scene.collection_selection 
+                if filter_text in item.name.lower()]
+
+
 # Operador para criar viewlayers
 class VIEWLAYER_OT_generate(Operator):
     bl_idname = "viewlayer.generate"
@@ -118,6 +228,11 @@ class VIEWLAYER_OT_generate(Operator):
         if not selected_collections:
             self.report({'ERROR'}, "Nenhuma collection selecionada!")
             return {'CANCELLED'}
+        
+        # Detectar AOVs dos shaders se a opção estiver ativada
+        detected_aovs = []
+        if props.detect_shader_aovs:
+            detected_aovs = self.get_shader_aovs()
         
         # Percorrer todas as collections selecionadas
         for collection_name in selected_collections:
@@ -166,7 +281,7 @@ class VIEWLAYER_OT_generate(Operator):
                 viewlayer.pass_cryptomatte_depth = int(props.cryptomatte_levels)
             
             # Adicionar AOVs personalizados
-            self.add_custom_aovs(viewlayer, props)
+            self.add_custom_aovs(viewlayer, props, detected_aovs)
             
             # Configurar visibilidade das collections
             self.setup_collection_visibility(viewlayer, collection_name)
@@ -174,12 +289,47 @@ class VIEWLAYER_OT_generate(Operator):
         self.report({'INFO'}, "ViewLayers gerados com sucesso!")
         return {'FINISHED'}
     
-    def add_custom_aovs(self, viewlayer, props):
-        # Adicionar AOV personalizado 1
+    def get_shader_aovs(self):
+        # Detectar AOVs nos shaders dos materiais
+        aov_info = []
+        
+        # Percorrer todos os materiais
+        for material in bpy.data.materials:
+            if material.use_nodes:
+                # Encontrar nós de saída AOV
+                for node in material.node_tree.nodes:
+                    if node.type == 'OUTPUT_AOV':
+                        # Obter nome do AOV
+                        aov_name = node.name
+                        if aov_name.startswith("AOV "):
+                            aov_name = aov_name[4:]  # Remover o prefixo "AOV "
+                        
+                        # Determinar o tipo de AOV com base nas conexões
+                        aov_type = 'COLOR'  # Padrão para color
+                        if node.inputs and node.inputs[0].links:
+                            socket_type = node.inputs[0].links[0].from_socket.type
+                            if socket_type == 'VALUE':
+                                aov_type = 'VALUE'
+                        
+                        # Adicionar à lista, evitando duplicatas
+                        if not any(info['name'] == aov_name for info in aov_info):
+                            aov_info.append({
+                                'name': aov_name,
+                                'type': aov_type
+                            })
+        
+        return aov_info
+    
+    def add_custom_aovs(self, viewlayer, props, detected_aovs):
+        # Adicionar AOVs detectados nos shaders
+        if props.detect_shader_aovs and detected_aovs:
+            for aov_info in detected_aovs:
+                self.add_aov(viewlayer, aov_info['name'], aov_info['type'])
+        
+        # Adicionar AOV personalizado 1 e 2 (se preenchidos)
         if props.aov1_name:
             self.add_aov(viewlayer, props.aov1_name, props.aov1_type)
         
-        # Adicionar AOV personalizado 2
         if props.aov2_name:
             self.add_aov(viewlayer, props.aov2_name, props.aov2_type)
     
@@ -269,6 +419,18 @@ class VIEWLAYER_PT_panel(Panel):
         # Botão para atualizar a lista de collections
         layout.operator("viewlayer.update_collections", icon='FILE_REFRESH')
         
+        # Filtro de collections
+        box = layout.box()
+        box.label(text="Filtrar Collections:")
+        row = box.row(align=True)
+        row.prop(props, "collection_filter", text="")
+        row.prop(props, "filter_case_sensitive", text="", icon='SMALLCAPS')
+        
+        # Botões para selecionar/desselecionar todas
+        row = box.row(align=True)
+        row.operator("viewlayer.select_all_collections", icon='CHECKBOX_HLT')
+        row.operator("viewlayer.deselect_all_collections", icon='CHECKBOX_DEHLT')
+        
         # Seção de seleção de collections
         box = layout.box()
         box.label(text="Selecione as Collections:")
@@ -277,12 +439,19 @@ class VIEWLAYER_PT_panel(Panel):
             box.label(text="Nenhuma collection encontrada.")
             box.label(text="Clique em 'Atualizar Collections'.")
         else:
-            for item in scene.collection_selection:
-                row = box.row()
-                icon = 'CHECKBOX_HLT' if item.selected else 'CHECKBOX_DEHLT'
-                row.operator("viewlayer.toggle_collection", 
-                             text=item.name, 
-                             icon=icon).collection_name = item.name
+            # Filtrar collections
+            filtered_collections = get_filtered_collections(scene, props)
+            
+            if filtered_collections:
+                for item_name in filtered_collections:
+                    item = scene.collection_selection[item_name]
+                    row = box.row()
+                    icon = 'CHECKBOX_HLT' if item.selected else 'CHECKBOX_DEHLT'
+                    row.operator("viewlayer.toggle_collection", 
+                                text=item.name, 
+                                icon=icon).collection_name = item.name
+            else:
+                box.label(text="Nenhuma collection corresponde ao filtro.")
         
         # Prefixo para os nomes dos viewlayers
         layout.prop(props, "viewlayer_prefix")
@@ -374,6 +543,12 @@ class VIEWLAYER_PT_aovs(Panel):
             box.prop(props, "use_cryptomatte_accurate")
             box.prop(props, "cryptomatte_levels")
         
+        # AOVs dos shaders
+        box = layout.box()
+        row = box.row()
+        row.prop(props, "detect_shader_aovs")
+        row.operator("viewlayer.detect_shader_aovs", text="", icon='VIEWZOOM')
+        
         # AOVs personalizados
         box = layout.box()
         box.label(text="AOVs Personalizados:")
@@ -394,6 +569,9 @@ classes = (
     CollectionItem,
     ViewLayerGeneratorProps,
     VIEWLAYER_OT_toggle_collection,
+    VIEWLAYER_OT_select_all_collections,
+    VIEWLAYER_OT_deselect_all_collections,
+    VIEWLAYER_OT_detect_shader_aovs,
     VIEWLAYER_OT_generate,
     VIEWLAYER_OT_update_collections,
     VIEWLAYER_PT_panel,
