@@ -1,5 +1,6 @@
 import bpy
 from bpy.types import Panel, Operator, PropertyGroup
+from bpy_extras.io_utils import ExportHelper, ImportHelper
 from bpy.props import (
     StringProperty,
     BoolProperty,
@@ -11,12 +12,212 @@ from bpy.props import (
 bl_info = {
     "name": "ViewLayer Generator",
     "author": "Claudin",
-    "version": (1, 2),  # Incrementing version number
+    "version": (1, 3),  # Incrementing version number
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > View Layer Generator",
     "description": "Gera viewlayers a partir de collections e configura passes e AOVs",
     "category": "Render",
 }
+
+# Operador para exportar configurações de ViewLayers como JSON
+class VIEWLAYER_OT_export_config(Operator, ExportHelper):
+    bl_idname = "viewlayer.export_config"
+    bl_label = "Exportar Configurações"
+    bl_description = "Exportar configurações de todos os viewlayers como JSON"
+    
+    filename_ext = ".json"
+    filter_glob: StringProperty(default="*.json", options={'HIDDEN'})
+    
+    def execute(self, context):
+        scene = context.scene
+        
+        # Criar dicionário para armazenar as configurações
+        config = {
+            'version': bl_info['version'],
+            'viewlayers': []
+        }
+        
+        # Percorrer todos os viewlayers
+        for viewlayer in scene.view_layers:
+            vl_data = {
+                'name': viewlayer.name,
+                'passes': {
+                    'use_pass_z': viewlayer.use_pass_z,
+                    'use_pass_mist': viewlayer.use_pass_mist,
+                    'use_pass_normal': viewlayer.use_pass_normal,
+                    'use_pass_vector': viewlayer.use_pass_vector,
+                    'use_pass_diffuse_direct': viewlayer.use_pass_diffuse_direct,
+                    'use_pass_diffuse_indirect': viewlayer.use_pass_diffuse_indirect,
+                    'use_pass_diffuse_color': viewlayer.use_pass_diffuse_color,
+                    'use_pass_glossy_direct': viewlayer.use_pass_glossy_direct,
+                    'use_pass_glossy_indirect': viewlayer.use_pass_glossy_indirect,
+                    'use_pass_glossy_color': viewlayer.use_pass_glossy_color,
+                    'use_pass_transmission_direct': viewlayer.use_pass_transmission_direct,
+                    'use_pass_transmission_indirect': viewlayer.use_pass_transmission_indirect,
+                    'use_pass_transmission_color': viewlayer.use_pass_transmission_color,
+                    'use_pass_emit': viewlayer.use_pass_emit,
+                    'use_pass_environment': viewlayer.use_pass_environment,
+                    'use_pass_shadow': viewlayer.use_pass_shadow,
+                    'use_pass_ambient_occlusion': viewlayer.use_pass_ambient_occlusion,
+                }
+            }
+            
+            # Adicionar informações sobre Cryptomatte, se disponível
+            if hasattr(viewlayer, "use_pass_cryptomatte"):
+                vl_data['passes']['use_pass_cryptomatte'] = viewlayer.use_pass_cryptomatte
+                
+                if hasattr(viewlayer, "use_pass_cryptomatte_accurate"):
+                    vl_data['passes']['use_pass_cryptomatte_accurate'] = viewlayer.use_pass_cryptomatte_accurate
+                
+                if hasattr(viewlayer, "pass_cryptomatte_depth"):
+                    vl_data['passes']['pass_cryptomatte_depth'] = viewlayer.pass_cryptomatte_depth
+            
+            # Salvar informações sobre AOVs
+            if hasattr(viewlayer, "aovs"):
+                vl_data['aovs'] = []
+                for aov in viewlayer.aovs:
+                    vl_data['aovs'].append({
+                        'name': aov.name,
+                        'type': aov.type
+                    })
+            
+            # Salvar informações sobre collections
+            vl_data['collections'] = {}
+            
+            def store_collection_visibility(layer_coll, collection_data):
+                collection_data[layer_coll.name] = {
+                    'exclude': layer_coll.exclude,
+                    'hide_viewport': layer_coll.hide_viewport,
+                    'indirect_only': layer_coll.indirect_only,
+                    'children': {}
+                }
+                
+                for child in layer_coll.children:
+                    store_collection_visibility(child, collection_data[layer_coll.name]['children'])
+            
+            # Começar a partir da camada de collection raiz
+            store_collection_visibility(viewlayer.layer_collection, vl_data['collections'])
+            
+            # Adicionar ao dicionário principal
+            config['viewlayers'].append(vl_data)
+        
+        # Escrever para o arquivo JSON
+        with open(self.filepath, 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=4)
+        
+        self.report({'INFO'}, f"Configurações exportadas para {self.filepath}")
+        return {'FINISHED'}
+
+
+    # Operador para importar configurações de ViewLayers de um JSON
+    class VIEWLAYER_OT_import_config(Operator, ImportHelper):
+        bl_idname = "viewlayer.import_config"
+        bl_label = "Importar Configurações"
+        bl_description = "Importar configurações de viewlayers de um arquivo JSON"
+        
+        filename_ext = ".json"
+        filter_glob: StringProperty(default="*.json", options={'HIDDEN'})
+        
+        def execute(self, context):
+            scene = context.scene
+            
+            # Verificar se o arquivo existe
+            if not os.path.exists(self.filepath):
+                self.report({'ERROR'}, f"Arquivo não encontrado: {self.filepath}")
+                return {'CANCELLED'}
+            
+            # Carregar o arquivo JSON
+            with open(self.filepath, 'r', encoding='utf-8') as f:
+                try:
+                    config = json.load(f)
+                except json.JSONDecodeError:
+                    self.report({'ERROR'}, "Arquivo JSON inválido")
+                    return {'CANCELLED'}
+            
+            # Verificar se o formato é compatível
+            if 'viewlayers' not in config:
+                self.report({'ERROR'}, "Formato de arquivo incompatível")
+                return {'CANCELLED'}
+            
+            # Contar ViewLayers criadas ou atualizadas
+            created_count = 0
+            updated_count = 0
+            
+            # Importar configurações para cada viewlayer
+            for vl_data in config['viewlayers']:
+                viewlayer_name = vl_data['name']
+                
+                # Verificar se o viewlayer já existe
+                if viewlayer_name in scene.view_layers:
+                    viewlayer = scene.view_layers[viewlayer_name]
+                    updated_count += 1
+                else:
+                    # Criar novo viewlayer
+                    viewlayer = scene.view_layers.new(viewlayer_name)
+                    created_count += 1
+                
+                # Configurar passes
+                if 'passes' in vl_data:
+                    passes = vl_data['passes']
+                    
+                    for pass_name, pass_value in passes.items():
+                        if hasattr(viewlayer, pass_name):
+                            setattr(viewlayer, pass_name, pass_value)
+                
+                # Configurar AOVs
+                if 'aovs' in vl_data and hasattr(viewlayer, "aovs"):
+                    # Remover AOVs existentes
+                    while len(viewlayer.aovs) > 0:
+                        viewlayer.aovs.remove(viewlayer.aovs[0])
+                    
+                    # Adicionar AOVs do arquivo
+                    for aov_data in vl_data['aovs']:
+                        aov = viewlayer.aovs.add()
+                        aov.name = aov_data['name']
+                        aov.type = aov_data['type']
+                
+                # Configurar visibilidade das collections
+                # Nota: Esta parte é mais complexa e pode requerer ajustes
+                # dependendo da estrutura específica do seu projeto
+                if 'collections' in vl_data:
+                    def apply_collection_visibility(layer_coll, collection_data):
+                        if layer_coll.name in collection_data:
+                            data = collection_data[layer_coll.name]
+                            layer_coll.exclude = data.get('exclude', False)
+                            layer_coll.hide_viewport = data.get('hide_viewport', False)
+                            layer_coll.indirect_only = data.get('indirect_only', False)
+                            
+                            # Processar filhos
+                            if 'children' in data:
+                                for child in layer_coll.children:
+                                    apply_collection_visibility(child, data['children'])
+                    
+                    # Tentar aplicar configurações
+                    try:
+                        apply_collection_visibility(viewlayer.layer_collection, vl_data['collections'])
+                    except Exception as e:
+                        self.report({'WARNING'}, f"Erro ao configurar collections para {viewlayer.name}: {str(e)}")
+            
+            self.report({'INFO'}, f"Importação concluída: {created_count} viewlayers criadas, {updated_count} atualizadas")
+            return {'FINISHED'}
+
+
+    # Painel para importação e exportação de configurações
+    class VIEWLAYER_PT_import_export(Panel):
+        bl_label = "Importar/Exportar"
+        bl_idname = "VIEWLAYER_PT_import_export"
+        bl_space_type = 'VIEW_3D'
+        bl_region_type = 'UI'
+        bl_category = 'View Layer Generator'
+        bl_parent_id = "VIEWLAYER_PT_panel"
+        bl_options = {'DEFAULT_CLOSED'}
+    
+    def draw(self, context):
+        layout = self.layout
+        
+        col = layout.column(align=True)
+        col.operator("viewlayer.export_config", icon='EXPORT')
+        col.operator("viewlayer.import_config", icon='IMPORT')
 
 # Classe para armazenar a seleção de collections
 class CollectionItem(PropertyGroup):
@@ -518,7 +719,7 @@ class VIEWLAYER_PT_panel(Panel):
         box.label(text="Filtrar Collections:")
         row = box.row(align=True)
         row.prop(props, "collection_filter", text="")
-        row.prop(props, "filter_case_sensitive", text="", icon='SMALLCAPS')
+        row.prop(props, "filter_case_sensitive", text="", icon='TEXT')
         
         # Botões para selecionar/desselecionar todas
         row = box.row(align=True)
@@ -674,7 +875,7 @@ class VIEWLAYER_PT_aovs(Panel):
         row.prop(props, "aov2_type")
 
 
-# Registro de classes
+# Atualizar lista de classes para incluir os novos operadores e painel
 classes = (
     CollectionItem,
     AOVItem,
@@ -686,9 +887,12 @@ classes = (
     VIEWLAYER_OT_detect_shader_aovs,
     VIEWLAYER_OT_generate,
     VIEWLAYER_OT_update_collections,
+    VIEWLAYER_OT_export_config,  # Novo operador para exportar
+    VIEWLAYER_OT_import_config,  # Novo operador para importar
     VIEWLAYER_PT_panel,
     VIEWLAYER_PT_passes,
     VIEWLAYER_PT_aovs,
+    VIEWLAYER_PT_import_export,  # Novo painel
 )
 
 def register():
