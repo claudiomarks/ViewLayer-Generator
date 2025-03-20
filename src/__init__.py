@@ -8,6 +8,7 @@ from bpy.props import (
     EnumProperty,
     CollectionProperty,
     PointerProperty
+    IntProperty
 )
 from bpy_extras.io_utils import ExportHelper, ImportHelper
 
