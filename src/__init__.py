@@ -233,6 +233,31 @@ class AOVItem(PropertyGroup):
 
 # Propriedades para armazenar configurações
 class ViewLayerGeneratorProps(PropertyGroup):
+    show_collections: BoolProperty(
+        name="Mostrar Collections",
+        description="Expandir ou colapsar a lista de collections",
+        default=True
+    )
+    
+    # Índice da collection ativa para template_list
+    active_collection_index: IntProperty(
+        name="Índice da Collection Ativa",
+        default=0
+    )
+    
+    # Propriedade para filtrar collections
+    collection_filter: StringProperty(
+        name="Filtro de Collections",
+        description="Filtrar collections por nome",
+        default=""
+    )
+    
+    # Opções de filtro
+    filter_case_sensitive: BoolProperty(
+        name="Case Sensitive",
+        description="Filtro sensível a maiúsculas/minúsculas",
+        default=False
+    )
     # Propriedade para filtrar collections
     collection_filter: StringProperty(
         name="Filtro de Collections",
@@ -728,33 +753,60 @@ class VIEWLAYER_PT_panel(Panel):
         row.operator("viewlayer.select_all_collections", icon='CHECKBOX_HLT')
         row.operator("viewlayer.deselect_all_collections", icon='CHECKBOX_DEHLT')
         
-        # Seção de seleção de collections
-        box = layout.box()
-        box.label(text="Selecione as Collections:")
-        
-        if len(scene.collection_selection) == 0:
-            box.label(text="Nenhuma collection encontrada.")
-            box.label(text="Clique em 'Atualizar Collections'.")
+        # Adicionar propriedade para controlar o estado do dropdown
+        if not hasattr(props, "show_collections"):
+            # Adicionaremos a propriedade na classe ViewLayerGeneratorProps mais tarde
+            box.label(text="Propriedade 'show_collections' não encontrada.")
         else:
-            # Filtrar collections
-            filtered_collections = get_filtered_collections(scene, props)
+            # Seção de seleção de collections com dropdown
+            collection_box = layout.box()
+            row = collection_box.row()
+            row.prop(props, "show_collections", 
+                     icon='TRIA_DOWN' if props.show_collections else 'TRIA_RIGHT',
+                     icon_only=True, emboss=False)
+            row.label(text=f"Collections ({len([i for i in scene.collection_selection if i.selected])}/{len(scene.collection_selection)} selecionadas)")
             
-            if filtered_collections:
-                for item_name in filtered_collections:
-                    item = scene.collection_selection[item_name]
-                    row = box.row()
-                    icon = 'CHECKBOX_HLT' if item.selected else 'CHECKBOX_DEHLT'
-                    row.operator("viewlayer.toggle_collection", 
-                                text=item.name, 
-                                icon=icon).collection_name = item.name
-            else:
-                box.label(text="Nenhuma collection corresponde ao filtro.")
+            # Mostrar collections apenas se o dropdown estiver expandido
+            if props.show_collections:
+                if len(scene.collection_selection) == 0:
+                    collection_box.label(text="Nenhuma collection encontrada.")
+                    collection_box.label(text="Clique em 'Atualizar Collections'.")
+                else:
+                    # Filtrar collections
+                    filtered_collections = get_filtered_collections(scene, props)
+                    
+                    if filtered_collections:
+                        scroll_area = collection_box.box()
+                        scroll_area.template_list("VIEWLAYER_UL_collections", "", scene, "collection_selection", 
+                                                 props, "active_collection_index", rows=5)
+                        
+                        # Exibir também a lista clicável para manter a funcionalidade original
+                        col = collection_box.column()
+                        for item_name in filtered_collections:
+                            item = scene.collection_selection[item_name]
+                            row = col.row()
+                            icon = 'CHECKBOX_HLT' if item.selected else 'CHECKBOX_DEHLT'
+                            row.operator("viewlayer.toggle_collection", 
+                                        text=item.name, 
+                                        icon=icon).collection_name = item.name
+                    else:
+                        collection_box.label(text="Nenhuma collection corresponde ao filtro.")
         
         # Prefixo para os nomes dos viewlayers
         layout.prop(props, "viewlayer_prefix")
         
         # Botão de geração
         layout.operator("viewlayer.generate", icon='RENDERLAYERS')
+
+class VIEWLAYER_UL_collections(bpy.types.UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname):
+        if self.layout_type in {'DEFAULT', 'COMPACT'}:
+            row = layout.row()
+            row.prop(item, "selected", text="")
+            row.label(text=item.name)
+        elif self.layout_type in {'GRID'}:
+            layout.alignment = 'CENTER'
+            layout.prop(item, "selected", text="")
 
 
 # Painel para configuração de passes
@@ -890,12 +942,13 @@ classes = (
     VIEWLAYER_OT_detect_shader_aovs,
     VIEWLAYER_OT_generate,
     VIEWLAYER_OT_update_collections,
-    VIEWLAYER_OT_export_config,  # Novo operador para exportar
-    VIEWLAYER_OT_import_config,  # Novo operador para importar
+    VIEWLAYER_OT_export_config,
+    VIEWLAYER_OT_import_config,
+    VIEWLAYER_UL_collections,  # Nova classe UIList
     VIEWLAYER_PT_panel,
     VIEWLAYER_PT_passes,
     VIEWLAYER_PT_aovs,
-    VIEWLAYER_PT_import_export,  # Novo painel
+    VIEWLAYER_PT_import_export,
 )
 
 def register():
