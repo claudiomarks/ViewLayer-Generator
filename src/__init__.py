@@ -11,7 +11,7 @@ from bpy.props import (
 bl_info = {
     "name": "ViewLayer Generator",
     "author": "Claudin",
-    "version": (1, 1),
+    "version": (1, 2),  # Incrementing version number
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > View Layer Generator",
     "description": "Gera viewlayers a partir de collections e configura passes e AOVs",
@@ -21,6 +21,12 @@ bl_info = {
 # Classe para armazenar a seleção de collections
 class CollectionItem(PropertyGroup):
     selected: BoolProperty(default=False)
+
+# Classe para armazenar AOVs detectados
+class AOVItem(PropertyGroup):
+    name: StringProperty()
+    type: StringProperty()
+    use: BoolProperty(default=True)
 
 # Propriedades para armazenar configurações
 class ViewLayerGeneratorProps(PropertyGroup):
@@ -104,6 +110,13 @@ class ViewLayerGeneratorProps(PropertyGroup):
     
     # Propriedade para o prefixo do nome do viewlayer (opcional)
     viewlayer_prefix: StringProperty(name="Prefixo", default="VL_")
+    
+    # Nova propriedade: aplicar AOVs de shader ao nó de saída
+    apply_aovs_to_compositor: BoolProperty(
+        name="Aplicar AOVs ao Compositor",
+        description="Conectar os AOVs detectados ao nó de saída do compositor",
+        default=True
+    )
 
 
 # Operador para alternar a seleção de coleções
@@ -162,6 +175,23 @@ class VIEWLAYER_OT_deselect_all_collections(Operator):
         return {'FINISHED'}
 
 
+# Operador para alternar a seleção de AOVs detectados
+class VIEWLAYER_OT_toggle_aov(Operator):
+    bl_idname = "viewlayer.toggle_aov"
+    bl_label = "Alternar AOV"
+    bl_description = "Alternar seleção do AOV detectado"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    aov_index: StringProperty()
+    
+    def execute(self, context):
+        scene = context.scene
+        if self.aov_index.isdigit() and int(self.aov_index) < len(scene.detected_aovs):
+            item = scene.detected_aovs[int(self.aov_index)]
+            item.use = not item.use
+        return {'FINISHED'}
+
+
 # Operador para detectar AOVs nos shaders
 class VIEWLAYER_OT_detect_shader_aovs(Operator):
     bl_idname = "viewlayer.detect_shader_aovs"
@@ -170,8 +200,14 @@ class VIEWLAYER_OT_detect_shader_aovs(Operator):
     bl_options = {'REGISTER', 'UNDO'}
     
     def execute(self, context):
+        scene = context.scene
+        
+        # Limpar lista de AOVs detectados
+        scene.detected_aovs.clear()
+        
         # Detectar AOVs existentes nos materiais
         aov_names = set()
+        aov_info = []
         
         # Percorrer todos os materiais
         for material in bpy.data.materials:
@@ -182,7 +218,29 @@ class VIEWLAYER_OT_detect_shader_aovs(Operator):
                         aov_name = node.name
                         if aov_name.startswith("AOV "):
                             aov_name = aov_name[4:]  # Remover o prefixo "AOV "
+                        
+                        # Determinar o tipo de AOV com base nas conexões
+                        aov_type = 'COLOR'  # Padrão para color
+                        if node.inputs and node.inputs[0].links:
+                            socket_type = node.inputs[0].links[0].from_socket.type
+                            if socket_type == 'VALUE':
+                                aov_type = 'VALUE'
+                        
                         aov_names.add(aov_name)
+                        
+                        # Adicionar à lista, evitando duplicatas
+                        if not any(info['name'] == aov_name for info in aov_info):
+                            aov_info.append({
+                                'name': aov_name,
+                                'type': aov_type
+                            })
+        
+        # Adicionar AOVs detectados à lista para interface
+        for info in aov_info:
+            item = scene.detected_aovs.add()
+            item.name = info['name']
+            item.type = info['type']
+            item.use = True
         
         # Exibir informações sobre os AOVs encontrados
         if aov_names:
@@ -229,10 +287,10 @@ class VIEWLAYER_OT_generate(Operator):
             self.report({'ERROR'}, "Nenhuma collection selecionada!")
             return {'CANCELLED'}
         
-        # Detectar AOVs dos shaders se a opção estiver ativada
-        detected_aovs = []
+        # Obter AOVs selecionados
+        selected_aovs = []
         if props.detect_shader_aovs:
-            detected_aovs = self.get_shader_aovs()
+            selected_aovs = [item for item in scene.detected_aovs if item.use]
         
         # Percorrer todas as collections selecionadas
         for collection_name in selected_collections:
@@ -281,50 +339,23 @@ class VIEWLAYER_OT_generate(Operator):
                 viewlayer.pass_cryptomatte_depth = int(props.cryptomatte_levels)
             
             # Adicionar AOVs personalizados
-            self.add_custom_aovs(viewlayer, props, detected_aovs)
+            self.add_custom_aovs(viewlayer, props, selected_aovs)
             
             # Configurar visibilidade das collections
             self.setup_collection_visibility(viewlayer, collection_name)
+            
+            # Se opção ativada, conectar AOVs ao compositor
+            if props.apply_aovs_to_compositor and selected_aovs:
+                self.setup_compositor_nodes(context.scene, viewlayer, selected_aovs)
         
         self.report({'INFO'}, "ViewLayers gerados com sucesso!")
         return {'FINISHED'}
     
-    def get_shader_aovs(self):
-        # Detectar AOVs nos shaders dos materiais
-        aov_info = []
-        
-        # Percorrer todos os materiais
-        for material in bpy.data.materials:
-            if material.use_nodes:
-                # Encontrar nós de saída AOV
-                for node in material.node_tree.nodes:
-                    if node.type == 'OUTPUT_AOV':
-                        # Obter nome do AOV
-                        aov_name = node.name
-                        if aov_name.startswith("AOV "):
-                            aov_name = aov_name[4:]  # Remover o prefixo "AOV "
-                        
-                        # Determinar o tipo de AOV com base nas conexões
-                        aov_type = 'COLOR'  # Padrão para color
-                        if node.inputs and node.inputs[0].links:
-                            socket_type = node.inputs[0].links[0].from_socket.type
-                            if socket_type == 'VALUE':
-                                aov_type = 'VALUE'
-                        
-                        # Adicionar à lista, evitando duplicatas
-                        if not any(info['name'] == aov_name for info in aov_info):
-                            aov_info.append({
-                                'name': aov_name,
-                                'type': aov_type
-                            })
-        
-        return aov_info
-    
-    def add_custom_aovs(self, viewlayer, props, detected_aovs):
-        # Adicionar AOVs detectados nos shaders
-        if props.detect_shader_aovs and detected_aovs:
-            for aov_info in detected_aovs:
-                self.add_aov(viewlayer, aov_info['name'], aov_info['type'])
+    def add_custom_aovs(self, viewlayer, props, selected_aovs):
+        # Adicionar AOVs detectados nos shaders que foram selecionados
+        if props.detect_shader_aovs and selected_aovs:
+            for aov_item in selected_aovs:
+                self.add_aov(viewlayer, aov_item.name, aov_item.type)
         
         # Adicionar AOV personalizado 1 e 2 (se preenchidos)
         if props.aov1_name:
@@ -373,6 +404,69 @@ class VIEWLAYER_OT_generate(Operator):
         target = find_layer_collection(root, target_collection_name)
         if target:
             target.exclude = False
+    
+    def setup_compositor_nodes(self, scene, viewlayer, aovs):
+        """Configurar nós do compositor para utilizar os AOVs"""
+        
+        # Verificar se o compositor está ativo
+        scene.use_nodes = True
+        
+        # Obter a árvore de nós do compositor
+        if not scene.node_tree:
+            return
+        
+        nodes = scene.node_tree.nodes
+        links = scene.node_tree.links
+        
+        # Procurar ou criar nó de entrada Render Layers para este viewlayer
+        rl_node = None
+        for node in nodes:
+            if node.type == 'R_LAYERS' and node.layer == viewlayer.name:
+                rl_node = node
+                break
+        
+        if not rl_node:
+            # Criar nó de entrada Render Layers
+            rl_node = nodes.new(type='CompositorNodeRLayers')
+            rl_node.layer = viewlayer.name
+            rl_node.location = (-300, 0)
+        
+        # Procurar ou criar nó de saída File Output para AOVs
+        output_node = None
+        for node in nodes:
+            if node.type == 'OUTPUT_FILE' and node.name == f"AOV_Output_{viewlayer.name}":
+                output_node = node
+                break
+        
+        if not output_node:
+            # Criar nó de saída File Output
+            output_node = nodes.new(type='CompositorNodeOutputFile')
+            output_node.name = f"AOV_Output_{viewlayer.name}"
+            output_node.label = f"AOVs de {viewlayer.name}"
+            output_node.location = (300, 0)
+            output_node.base_path = "//renders/aovs/"
+        
+        # Limpar slots existentes no nó de saída
+        while len(output_node.file_slots) > 0:
+            output_node.file_slots.remove(output_node.file_slots[0])
+        
+        # Adicionar slots para cada AOV e conectar
+        for i, aov in enumerate(aovs):
+            # Adicionar slot de saída
+            if i > 0:  # O primeiro slot já existe
+                output_node.file_slots.new(aov.name)
+            else:
+                output_node.file_slots[0].path = aov.name
+            
+            # Tentar conectar o socket de saída do AOV
+            aov_socket = None
+            for socket in rl_node.outputs:
+                if socket.name == aov.name:
+                    aov_socket = socket
+                    break
+            
+            if aov_socket:
+                links.new(aov_socket, output_node.inputs[i])
 
 
 # Operador para atualizar a lista de collections
@@ -531,7 +625,8 @@ class VIEWLAYER_PT_aovs(Panel):
     
     def draw(self, context):
         layout = self.layout
-        props = context.scene.viewlayer_generator_props
+        scene = context.scene
+        props = scene.viewlayer_generator_props
         
         # Cryptomatte
         box = layout.box()
@@ -548,6 +643,21 @@ class VIEWLAYER_PT_aovs(Panel):
         row = box.row()
         row.prop(props, "detect_shader_aovs")
         row.operator("viewlayer.detect_shader_aovs", text="", icon='VIEWZOOM')
+        
+        # Nova opção para aplicar AOVs ao compositor
+        row = box.row()
+        row.prop(props, "apply_aovs_to_compositor")
+        
+        # Lista de AOVs detectados
+        if len(scene.detected_aovs) > 0:
+            box.label(text="AOVs Detectados:")
+            for i, aov in enumerate(scene.detected_aovs):
+                row = box.row()
+                icon = 'CHECKBOX_HLT' if aov.use else 'CHECKBOX_DEHLT'
+                op = row.operator("viewlayer.toggle_aov", 
+                            text=f"{aov.name} ({aov.type})", 
+                            icon=icon)
+                op.aov_index = str(i)
         
         # AOVs personalizados
         box = layout.box()
@@ -567,10 +677,12 @@ class VIEWLAYER_PT_aovs(Panel):
 # Registro de classes
 classes = (
     CollectionItem,
+    AOVItem,
     ViewLayerGeneratorProps,
     VIEWLAYER_OT_toggle_collection,
     VIEWLAYER_OT_select_all_collections,
     VIEWLAYER_OT_deselect_all_collections,
+    VIEWLAYER_OT_toggle_aov,
     VIEWLAYER_OT_detect_shader_aovs,
     VIEWLAYER_OT_generate,
     VIEWLAYER_OT_update_collections,
@@ -584,12 +696,14 @@ def register():
         bpy.utils.register_class(cls)
     bpy.types.Scene.viewlayer_generator_props = PointerProperty(type=ViewLayerGeneratorProps)
     bpy.types.Scene.collection_selection = CollectionProperty(type=CollectionItem)
+    bpy.types.Scene.detected_aovs = CollectionProperty(type=AOVItem)
 
 def unregister():
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
     del bpy.types.Scene.viewlayer_generator_props
     del bpy.types.Scene.collection_selection
+    del bpy.types.Scene.detected_aovs
 
 if __name__ == "__main__":
     register()
