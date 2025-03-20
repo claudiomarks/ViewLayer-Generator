@@ -7,7 +7,7 @@ from bpy.props import (
     BoolProperty,
     EnumProperty,
     CollectionProperty,
-    PointerProperty
+    PointerProperty,
     IntProperty
 )
 from bpy_extras.io_utils import ExportHelper, ImportHelper
