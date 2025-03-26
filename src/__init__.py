@@ -1,1142 +1,1024 @@
 import bpy
 import json
 import os
-from bpy.types import Panel, Operator, PropertyGroup
-from bpy.props import (
-    StringProperty,
-    BoolProperty,
-    EnumProperty,
-    CollectionProperty,
-    PointerProperty,
-    IntProperty
-)
+import sys  # Para listar os módulos carregados
+from bpy.types import Panel, Operator, UIList
+from bpy.props import StringProperty, BoolProperty, EnumProperty
 from bpy_extras.io_utils import ExportHelper, ImportHelper
 
+# Importar módulos do addon (caminhos atualizados)
+from .utils import passes_data
+from .properties import CollectionItem, PassItem, ViewLayerGeneratorProps, register as register_properties, unregister as unregister_properties
+from .preferences import initialize_default_passes, register_preferences, unregister_preferences
+
 bl_info = {
-    "name": "ViewLayer Generator",
-    "author": "Claudin",
-    "version": (1, 3),  # Incrementing version number
-    "blender": (3, 0, 0),
+    "name": "viewlayer_generator",
+    "author": "histeria",
+    "version": (2, 2, 2),
+    "blender": (4, 3, 0),
     "location": "View3D > Sidebar > View Layer Generator",
     "description": "Gera viewlayers a partir de collections e configura passes e AOVs",
     "category": "Render",
 }
 
+# ==========================
+# Funções Auxiliares
+# ==========================
+def get_filtered_collections(scene, filter_text, case_sensitive):
+    """Filtrar collections com base no texto fornecido."""
+    if not filter_text:
+        return [item.name for item in scene.collection_selection]
+    filter_text = filter_text if case_sensitive else filter_text.lower()
+    return [
+        item.name
+        for item in scene.collection_selection
+        if (filter_text in item.name if case_sensitive else filter_text in item.name.lower())
+    ]
 
 
+def toggle_selection(items, select_all=True):
+    """Alternar seleção de uma lista de items."""
+    for item in items:
+        item.selected = select_all
 
 
-import bpy
-from bpy.types import Operator
-
-class VIEWLAYER_OT_generate_apply_aovs(Operator):
-    bl_idname = "viewlayer.generate_apply_aovs"
-    bl_label = "Gerar e Aplicar AOVs"
-    bl_description = "Detectar AOVs nos materiais e aplicar em todos os ViewLayers selecionados"
-    bl_options = {'REGISTER', 'UNDO'}
-    
-    def execute(self, context):
-        scene = context.scene
-        
-        # Detectar AOVs existentes nos materiais
-        aov_info = self.detect_material_aovs()
-        
-        if not aov_info:
-            self.report({'WARNING'}, "Nenhum AOV encontrado nos materiais.")
-            return {'CANCELLED'}
-        
-        # Verificar se há viewlayers selecionados
-        viewlayers = []
-        for layer in scene.view_layers:
-            # Verificar se o viewlayer está ativo/selecionado usando a primeira collection selecionada
-            for item in scene.collection_selection:
-                if item.selected and layer.name.endswith(item.name):
-                    viewlayers.append(layer)
-                    break
-        
-        if not viewlayers:
-            self.report({'ERROR'}, "Nenhum ViewLayer correspondente às collections selecionadas foi encontrado!")
-            return {'CANCELLED'}
-        
-        # Aplicar AOVs aos viewlayers selecionados
-        count = 0
-        for viewlayer in viewlayers:
-            for aov_data in aov_info:
-                self.add_aov(viewlayer, aov_data['name'], aov_data['type'])
-                count += 1
-            
-            # Se a opção estiver ativada, configurar o compositor
-            if scene.viewlayer_generator_props.apply_aovs_to_compositor:
-                self.setup_compositor_nodes(scene, viewlayer, aov_info)
-        
-        self.report({'INFO'}, f"Aplicados {len(aov_info)} AOVs em {len(viewlayers)} ViewLayers.")
-        return {'FINISHED'}
-    
-    def detect_material_aovs(self):
-        """Detectar AOVs configurados nos shaders do projeto"""
-        aov_info = []
-        
-        # Percorrer todos os materiais
-        for material in bpy.data.materials:
-            if material.use_nodes:
-                # Encontrar nós de saída AOV
-                for node in material.node_tree.nodes:
-                    if node.type == 'OUTPUT_AOV':
-                        aov_name = node.name
-                        if aov_name.startswith("AOV "):
-                            aov_name = aov_name[4:]  # Remover o prefixo "AOV "
+def detect_material_aovs():
+    """Detectar AOVs configurados nos shaders do projeto."""
+    aov_info = []
+    for material in bpy.data.materials:
+        if material.use_nodes:
+            for node in material.node_tree.nodes:
+                if node.type == "OUTPUT_AOV":
+                    # Usar o valor do campo name ao invés do nome do nó
+                    # O campo name do nó OUTPUT_AOV contém o nome real do AOV
+                    aov_name = node.name
+                    if hasattr(node, "inputs") and len(node.inputs) > 0:
+                        aov_type = "VALUE" if node.inputs[0].links and node.inputs[0].links[0].from_socket.type == "VALUE" else "COLOR"
                         
-                        # Determinar o tipo de AOV com base nas conexões
-                        aov_type = 'COLOR'  # Padrão para color
-                        if node.inputs and node.inputs[0].links:
-                            socket_type = node.inputs[0].links[0].from_socket.type
-                            if socket_type == 'VALUE':
-                                aov_type = 'VALUE'
-                        
-                        # Adicionar à lista, evitando duplicatas
-                        if not any(info['name'] == aov_name for info in aov_info):
-                            aov_info.append({
-                                'name': aov_name,
-                                'type': aov_type
-                            })
-        
-        return aov_info
+                        # Verificar se este AOV já foi detectado antes
+                        if not any(info["name"] == aov_name for info in aov_info):
+                            aov_info.append({"name": aov_name, "type": aov_type})
+    return aov_info
+
+
+def apply_aovs_to_viewlayer(viewlayer, aov_info):
+    """Adicionar AOVs a um viewlayer."""
+    if not hasattr(viewlayer, "aovs"):
+        return
+    for aov_data in aov_info:
+        existing_aov = next((aov for aov in viewlayer.aovs if aov.name == aov_data["name"]), None)
+        if existing_aov:
+            existing_aov.type = aov_data["type"]
+        else:
+            new_aov = viewlayer.aovs.add()
+            new_aov.name = aov_data["name"]
+            new_aov.type = aov_data["type"]
+
+def is_gp_collection(collection_name):
+    """Verificar se uma collection é para Grease Pencil."""
+    return collection_name.endswith(".GP") or collection_name.endswith(".GP.vl")
+
+# ==========================
+# UIList para Collections
+# ==========================
+class VIEWLAYER_UL_collections(UIList):
+    """Lista de collections para seleção."""
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        if self.layout_type in {'DEFAULT', 'COMPACT'}:
+            row = layout.row(align=True)
+            row.prop(item, "selected", text="")
+            row.label(text=item.name, icon="OUTLINER_COLLECTION")
+        elif self.layout_type in {'GRID'}:
+            layout.alignment = 'CENTER'
+            layout.label(text="", icon="OUTLINER_COLLECTION")
+
+
+# ==========================
+# UIList para Passes
+# ==========================
+class VIEWLAYER_UL_passes(UIList):
+    """Lista de passes de renderização disponíveis."""
     
-    def add_aov(self, viewlayer, name, aov_type):
-        """Adicionar um AOV a um viewlayer"""
-        # Verificar se o viewlayer tem o atributo 'aovs'
-        if not hasattr(viewlayer, "aovs"):
-            return
+    def filter_items(self, context, data, propname):
+        passes = getattr(data, propname)
+        props = context.scene.viewlayer_generator_props
         
-        # Verificar se o AOV já existe
-        for aov in viewlayer.aovs:
-            if aov.name == name:
-                aov.type = aov_type
-                return
-        
-        # Adicionar novo AOV
-        aov = viewlayer.aovs.add()
-        aov.name = name
-        aov.type = aov_type
-    
-    def setup_compositor_nodes(self, scene, viewlayer, aov_info):
-        """Configurar nós do compositor para utilizar os AOVs"""
-        
-        # Verificar se o compositor está ativo
-        scene.use_nodes = True
-        
-        # Obter a árvore de nós do compositor
-        if not scene.node_tree:
-            return
-        
-        nodes = scene.node_tree.nodes
-        links = scene.node_tree.links
-        
-        # Procurar ou criar nó de entrada Render Layers para este viewlayer
-        rl_node = None
-        for node in nodes:
-            if node.type == 'R_LAYERS' and node.layer == viewlayer.name:
-                rl_node = node
-                break
-        
-        if not rl_node:
-            # Criar nó de entrada Render Layers
-            rl_node = nodes.new(type='CompositorNodeRLayers')
-            rl_node.layer = viewlayer.name
-            rl_node.location = (-300, 0)
-        
-        # Procurar ou criar nó de saída File Output para AOVs
-        output_node = None
-        for node in nodes:
-            if node.type == 'OUTPUT_FILE' and node.name == f"AOV_Output_{viewlayer.name}":
-                output_node = node
-                break
-        
-        if not output_node:
-            # Criar nó de saída File Output
-            output_node = nodes.new(type='CompositorNodeOutputFile')
-            output_node.name = f"AOV_Output_{viewlayer.name}"
-            output_node.label = f"AOVs de {viewlayer.name}"
-            output_node.location = (300, 0)
-            output_node.base_path = "//renders/aovs/"
-        
-        # Limpar slots existentes no nó de saída
-        while len(output_node.file_slots) > 0:
-            output_node.file_slots.remove(output_node.file_slots[0])
-        
-        # Adicionar slots para cada AOV e conectar
-        for i, aov_data in enumerate(aov_info):
-            # Adicionar slot de saída
-            if i > 0:  # O primeiro slot já existe
-                output_node.file_slots.new(aov_data['name'])
+        # Filtrar com base nas categorias selecionadas
+        flt_flags = []
+        for item in passes:
+            # Verificar a categoria do passe e o filtro correspondente
+            if (item.category == "Data" and props.show_data_passes) or \
+               (item.category == "Light" and props.show_light_passes) or \
+               (item.category == "Crypto Matte" and props.show_crypto_passes) or \
+               (item.category == "Other"):
+                flt_flags.append(self.bitflag_filter_item)
             else:
-                output_node.file_slots[0].path = aov_data['name']
-            
-            # Tentar conectar o socket de saída do AOV
-            aov_socket = None
-            for socket in rl_node.outputs:
-                if socket.name == aov_data['name']:
-                    aov_socket = socket
-                    break
-            
-            if aov_socket:
-                links.new(aov_socket, output_node.inputs[i])
-
-
-
-
-
-
-
-
-# Operador para exportar configurações de ViewLayers como JSON
-class VIEWLAYER_OT_export_config(Operator, ExportHelper):
-    bl_idname = "viewlayer.export_config"
-    bl_label = "Exportar Configurações"
-    bl_description = "Exportar configurações de todos os viewlayers como JSON"
-    
-    filename_ext = ".json"
-    filter_glob: StringProperty(default="*.json", options={'HIDDEN'})
-    
-    def execute(self, context):
-        scene = context.scene
-        
-        # Criar dicionário para armazenar as configurações
-        config = {
-            'version': bl_info['version'],
-            'viewlayers': []
-        }
-        
-        # Percorrer todos os viewlayers
-        for viewlayer in scene.view_layers:
-            vl_data = {
-                'name': viewlayer.name,
-                'passes': {
-                    'use_pass_z': viewlayer.use_pass_z,
-                    'use_pass_mist': viewlayer.use_pass_mist,
-                    'use_pass_normal': viewlayer.use_pass_normal,
-                    'use_pass_vector': viewlayer.use_pass_vector,
-                    'use_pass_diffuse_direct': viewlayer.use_pass_diffuse_direct,
-                    'use_pass_diffuse_indirect': viewlayer.use_pass_diffuse_indirect,
-                    'use_pass_diffuse_color': viewlayer.use_pass_diffuse_color,
-                    'use_pass_glossy_direct': viewlayer.use_pass_glossy_direct,
-                    'use_pass_glossy_indirect': viewlayer.use_pass_glossy_indirect,
-                    'use_pass_glossy_color': viewlayer.use_pass_glossy_color,
-                    'use_pass_transmission_direct': viewlayer.use_pass_transmission_direct,
-                    'use_pass_transmission_indirect': viewlayer.use_pass_transmission_indirect,
-                    'use_pass_transmission_color': viewlayer.use_pass_transmission_color,
-                    'use_pass_emit': viewlayer.use_pass_emit,
-                    'use_pass_environment': viewlayer.use_pass_environment,
-                    'use_pass_shadow': viewlayer.use_pass_shadow,
-                    'use_pass_ambient_occlusion': viewlayer.use_pass_ambient_occlusion,
-                }
-            }
-            
-            # Adicionar informações sobre Cryptomatte, se disponível
-            if hasattr(viewlayer, "use_pass_cryptomatte"):
-                vl_data['passes']['use_pass_cryptomatte'] = viewlayer.use_pass_cryptomatte
+                flt_flags.append(0)
                 
-                if hasattr(viewlayer, "use_pass_cryptomatte_accurate"):
-                    vl_data['passes']['use_pass_cryptomatte_accurate'] = viewlayer.use_pass_cryptomatte_accurate
+        # Agrupar por categoria
+        flt_neworder = []
+        
+        return flt_flags, flt_neworder
+    
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        if self.layout_type in {'DEFAULT', 'COMPACT'}:
+            row = layout.row(align=True)
+            row.prop(item, "selected", text="")
+            
+            # Usar a função auxiliar para obter o nome amigável
+            display_name = passes_data.get_friendly_name(item.name)
                 
-                if hasattr(viewlayer, "pass_cryptomatte_depth"):
-                    vl_data['passes']['pass_cryptomatte_depth'] = viewlayer.pass_cryptomatte_depth
-            
-            # Salvar informações sobre AOVs
-            if hasattr(viewlayer, "aovs"):
-                vl_data['aovs'] = []
-                for aov in viewlayer.aovs:
-                    vl_data['aovs'].append({
-                        'name': aov.name,
-                        'type': aov.type
-                    })
-            
-            # Salvar informações sobre collections
-            vl_data['collections'] = {}
-            
-            def store_collection_visibility(layer_coll, collection_data):
-                collection_data[layer_coll.name] = {
-                    'exclude': layer_coll.exclude,
-                    'hide_viewport': layer_coll.hide_viewport,
-                    'indirect_only': layer_coll.indirect_only,
-                    'children': {}
-                }
-                
-                for child in layer_coll.children:
-                    store_collection_visibility(child, collection_data[layer_coll.name]['children'])
-            
-            # Começar a partir da camada de collection raiz
-            store_collection_visibility(viewlayer.layer_collection, vl_data['collections'])
-            
-            # Adicionar ao dicionário principal
-            config['viewlayers'].append(vl_data)
-        
-        # Escrever para o arquivo JSON
-        with open(self.filepath, 'w', encoding='utf-8') as f:
-            json.dump(config, f, indent=4)
-        
-        self.report({'INFO'}, f"Configurações exportadas para {self.filepath}")
-        return {'FINISHED'}
+            row.label(text=display_name, icon="NODE_MATERIAL")
+        elif self.layout_type in {'GRID'}:
+            layout.alignment = 'CENTER'
+            layout.label(text="", icon="NODE_MATERIAL")
 
 
-# Operador para importar configurações de ViewLayers de um JSON
-class VIEWLAYER_OT_import_config(Operator, ImportHelper):
-    bl_idname = "viewlayer.import_config"
-    bl_label = "Importar Configurações"
-    bl_description = "Importar configurações de viewlayers de um arquivo JSON"
-    
-    filename_ext = ".json"
-    filter_glob: StringProperty(default="*.json", options={'HIDDEN'})
-    
+# UIList para AOVs
+class VIEWLAYER_UL_aovs(UIList):
+    """Lista de AOVs detectados no projeto."""
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        if self.layout_type in {'DEFAULT', 'COMPACT'}:
+            row = layout.row(align=True)
+            row.prop(item, "selected", text="")
+            row.label(text=item.name, icon="MATERIAL")
+            
+            # Mostrar o tipo de AOV (COLOR ou VALUE)
+            row.label(text=getattr(item, "type", "COLOR"))
+        elif self.layout_type in {'GRID'}:
+            layout.alignment = 'CENTER'
+            layout.label(text="", icon="MATERIAL")
+
+
+# ==========================
+# Operadores
+# ==========================
+class VIEWLAYER_OT_toggle_selection(Operator):
+    """Alternar seleção de items (collections ou AOVs)."""
+    bl_idname = "viewlayer.toggle_selection"
+    bl_label = "Alternar Seleção"
+    bl_options = {"REGISTER", "UNDO"}
+
+    select_all: BoolProperty(default=True)
+    target: StringProperty(default="collections")  # "collections" ou "aovs"
+
     def execute(self, context):
         scene = context.scene
-        
-        # Verificar se o arquivo existe
-        if not os.path.exists(self.filepath):
-            self.report({'ERROR'}, f"Arquivo não encontrado: {self.filepath}")
-            return {'CANCELLED'}
-        
-        # Carregar o arquivo JSON
-        with open(self.filepath, 'r', encoding='utf-8') as f:
-            try:
-                config = json.load(f)
-            except json.JSONDecodeError:
-                self.report({'ERROR'}, "Arquivo JSON inválido")
-                return {'CANCELLED'}
-        
-        # Verificar se o formato é compatível
-        if 'viewlayers' not in config:
-            self.report({'ERROR'}, "Formato de arquivo incompatível")
-            return {'CANCELLED'}
-        
-        # Contar ViewLayers criadas ou atualizadas
-        created_count = 0
-        updated_count = 0
-        
-        # Importar configurações para cada viewlayer
-        for vl_data in config['viewlayers']:
-            viewlayer_name = vl_data['name']
-            
-            # Verificar se o viewlayer já existe
-            if viewlayer_name in scene.view_layers:
-                viewlayer = scene.view_layers[viewlayer_name]
-                updated_count += 1
-            else:
-                # Criar novo viewlayer
-                viewlayer = scene.view_layers.new(viewlayer_name)
-                created_count += 1
-            
-            # Configurar passes
-            if 'passes' in vl_data:
-                passes = vl_data['passes']
-                
-                for pass_name, pass_value in passes.items():
-                    if hasattr(viewlayer, pass_name):
-                        setattr(viewlayer, pass_name, pass_value)
-            
-            # Configurar AOVs
-            if 'aovs' in vl_data and hasattr(viewlayer, "aovs"):
-                # Remover AOVs existentes
-                while len(viewlayer.aovs) > 0:
-                    viewlayer.aovs.remove(viewlayer.aovs[0])
-                
-                # Adicionar AOVs do arquivo
-                for aov_data in vl_data['aovs']:
-                    aov = viewlayer.aovs.add()
-                    aov.name = aov_data['name']
-                    aov.type = aov_data['type']
-            
-            # Configurar visibilidade das collections
-            if 'collections' in vl_data:
-                def apply_collection_visibility(layer_coll, collection_data):
-                    if layer_coll.name in collection_data:
-                        data = collection_data[layer_coll.name]
-                        layer_coll.exclude = data.get('exclude', False)
-                        layer_coll.hide_viewport = data.get('hide_viewport', False)
-                        layer_coll.indirect_only = data.get('indirect_only', False)
-                        
-                        # Processar filhos
-                        if 'children' in data:
-                            for child in layer_coll.children:
-                                apply_collection_visibility(child, data['children'])
-                
-                # Tentar aplicar configurações
-                try:
-                    apply_collection_visibility(viewlayer.layer_collection, vl_data['collections'])
-                except Exception as e:
-                    self.report({'WARNING'}, f"Erro ao configurar collections para {viewlayer.name}: {str(e)}")
-        
-        self.report({'INFO'}, f"Importação concluída: {created_count} viewlayers criadas, {updated_count} atualizadas")
-        return {'FINISHED'}
+        items = scene.collection_selection if self.target == "collections" else scene.detected_aovs
+        toggle_selection(items, self.select_all)
+        return {"FINISHED"}
 
 
-# Painel para importação e exportação de configurações
-class VIEWLAYER_PT_import_export(Panel):
-    bl_label = "Importar/Exportar"
-    bl_idname = "VIEWLAYER_PT_import_export"
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'UI'
-    bl_category = 'View Layer Generator'
-    bl_parent_id = "VIEWLAYER_PT_panel"
-    bl_options = {'DEFAULT_CLOSED'}
-    
-    def draw(self, context):
-        layout = self.layout
-        
-        col = layout.column(align=True)
-        col.operator("viewlayer.export_config", icon='EXPORT')
-        col.operator("viewlayer.import_config", icon='IMPORT')
+class VIEWLAYER_OT_detect_aovs(Operator):
+    """Detectar AOVs nos materiais do projeto."""
+    bl_idname = "viewlayer.detect_aovs"
+    bl_label = "Detectar AOVs"
+    bl_options = {"REGISTER", "UNDO"}
 
-################################################################
-
-# Classe para armazenar a seleção de collections
-class CollectionItem(PropertyGroup):
-    selected: BoolProperty(default=False)
-
-# Classe para armazenar AOVs detectados
-class AOVItem(PropertyGroup):
-    name: StringProperty()
-    type: StringProperty()
-    use: BoolProperty(default=True)
-
-# Propriedades para armazenar configurações
-class ViewLayerGeneratorProps(PropertyGroup):
-    show_collections: BoolProperty(
-        name="Mostrar Collections",
-        description="Expandir ou colapsar a lista de collections",
-        default=True
-    )
-    
-    # Índice da collection ativa para template_list
-    active_collection_index: IntProperty(
-        name="Índice da Collection Ativa",
-        default=0
-    )
-    
-    # Propriedade para filtrar collections
-    collection_filter: StringProperty(
-        name="Filtro de Collections",
-        description="Filtrar collections por nome",
-        default=""
-    )
-    
-    # Opções de filtro
-    filter_case_sensitive: BoolProperty(
-        name="Case Sensitive",
-        description="Filtro sensível a maiúsculas/minúsculas",
-        default=False
-    )
-    # Propriedade para filtrar collections
-    collection_filter: StringProperty(
-        name="Filtro de Collections",
-        description="Filtrar collections por nome",
-        default=""
-    )
-    
-    # Opções de filtro
-    filter_case_sensitive: BoolProperty(
-        name="Case Sensitive",
-        description="Filtro sensível a maiúsculas/minúsculas",
-        default=False
-    )
-    
-    # Propriedades para os passes
-    use_z: BoolProperty(name="Z", default=False)
-    use_mist: BoolProperty(name="Mist", default=False)
-    use_normal: BoolProperty(name="Normal", default=False)
-    use_vector: BoolProperty(name="Vector", default=False)
-    use_diffuse_direct: BoolProperty(name="Diffuse Direct", default=False)
-    use_diffuse_indirect: BoolProperty(name="Diffuse Indirect", default=False)
-    use_diffuse_color: BoolProperty(name="Diffuse Color", default=False)
-    use_glossy_direct: BoolProperty(name="Glossy Direct", default=False)
-    use_glossy_indirect: BoolProperty(name="Glossy Indirect", default=False)
-    use_glossy_color: BoolProperty(name="Glossy Color", default=False)
-    use_transmission_direct: BoolProperty(name="Transmission Direct", default=False)
-    use_transmission_indirect: BoolProperty(name="Transmission Indirect", default=False)
-    use_transmission_color: BoolProperty(name="Transmission Color", default=False)
-    use_emit: BoolProperty(name="Emit", default=False)
-    use_environment: BoolProperty(name="Environment", default=False)
-    use_shadow: BoolProperty(name="Shadow", default=False)
-    use_ambient_occlusion: BoolProperty(name="Ambient Occlusion", default=False)
-    
-    # Propriedades para AOVs
-    use_cryptomatte: BoolProperty(name="Cryptomatte", default=False)
-    use_cryptomatte_accurate: BoolProperty(name="Cryptomatte Accurate", default=False)
-    cryptomatte_levels: EnumProperty(
-        name="Cryptomatte Levels",
-        items=[
-            ('2', "2 Levels", ""),
-            ('3', "3 Levels", ""),
-            ('4', "4 Levels", ""),
-            ('5', "5 Levels", ""),
-            ('6', "6 Levels", ""),
-            ('7', "7 Levels", ""),
-            ('8', "8 Levels", ""),
-        ],
-        default='2'
-    )
-    
-    # Propriedades para verificar AOVs existentes nos materiais
-    detect_shader_aovs: BoolProperty(
-        name="Detectar AOVs dos Shaders",
-        description="Detectar e usar AOVs já configurados nos shaders",
-        default=False
-    )
-    
-    # Propriedades para AOVs personalizados
-    aov1_name: StringProperty(name="AOV 1 Nome", default="")
-    aov1_type: EnumProperty(
-        name="AOV 1 Tipo",
-        items=[
-            ('COLOR', "Color", ""),
-            ('VALUE', "Value", ""),
-        ],
-        default='COLOR'
-    )
-    
-    aov2_name: StringProperty(name="AOV 2 Nome", default="")
-    aov2_type: EnumProperty(
-        name="AOV 2 Tipo",
-        items=[
-            ('COLOR', "Color", ""),
-            ('VALUE', "Value", ""),
-        ],
-        default='COLOR'
-    )
-    
-    # Propriedade para o prefixo do nome do viewlayer (opcional)
-    viewlayer_prefix: StringProperty(name="Prefixo", default="VL_")
-    
-    # Nova propriedade: aplicar AOVs de shader ao nó de saída
-    apply_aovs_to_compositor: BoolProperty(
-        name="Aplicar AOVs ao Compositor",
-        description="Conectar os AOVs detectados ao nó de saída do compositor",
-        default=True
-    )
-
-
-# Operador para alternar a seleção de coleções
-class VIEWLAYER_OT_toggle_collection(Operator):
-    bl_idname = "viewlayer.toggle_collection"
-    bl_label = "Alternar Collection"
-    bl_description = "Alternar seleção da collection"
-    bl_options = {'REGISTER', 'UNDO'}
-    
-    collection_name: StringProperty()
-    
     def execute(self, context):
         scene = context.scene
-        if self.collection_name in scene.collection_selection:
-            item = scene.collection_selection[self.collection_name]
-            item.selected = not item.selected
-        return {'FINISHED'}
-
-
-# Operador para selecionar todas as collections visíveis (após filtro)
-class VIEWLAYER_OT_select_all_collections(Operator):
-    bl_idname = "viewlayer.select_all_collections"
-    bl_label = "Selecionar Todas"
-    bl_description = "Selecionar todas as collections visíveis"
-    bl_options = {'REGISTER', 'UNDO'}
-    
-    def execute(self, context):
-        scene = context.scene
-        props = scene.viewlayer_generator_props
-        
-        # Obter coleções filtradas
-        filtered_collections = get_filtered_collections(scene, props)
-        
-        # Selecionar todas as coleções filtradas
-        for collection_name in filtered_collections:
-            if collection_name in scene.collection_selection:
-                scene.collection_selection[collection_name].selected = True
-        
-        return {'FINISHED'}
-
-
-# Operador para desselecionar todas as collections
-class VIEWLAYER_OT_deselect_all_collections(Operator):
-    bl_idname = "viewlayer.deselect_all_collections"
-    bl_label = "Desselecionar Todas"
-    bl_description = "Desselecionar todas as collections"
-    bl_options = {'REGISTER', 'UNDO'}
-    
-    def execute(self, context):
-        scene = context.scene
-        
-        # Desselecionar todas as coleções
-        for item in scene.collection_selection:
-            item.selected = False
-        
-        return {'FINISHED'}
-
-
-# Operador para alternar a seleção de AOVs detectados
-class VIEWLAYER_OT_toggle_aov(Operator):
-    bl_idname = "viewlayer.toggle_aov"
-    bl_label = "Alternar AOV"
-    bl_description = "Alternar seleção do AOV detectado"
-    bl_options = {'REGISTER', 'UNDO'}
-    
-    aov_index: StringProperty()
-    
-    def execute(self, context):
-        scene = context.scene
-        if self.aov_index.isdigit() and int(self.aov_index) < len(scene.detected_aovs):
-            item = scene.detected_aovs[int(self.aov_index)]
-            item.use = not item.use
-        return {'FINISHED'}
-
-
-# Operador para detectar AOVs nos shaders
-class VIEWLAYER_OT_detect_shader_aovs(Operator):
-    bl_idname = "viewlayer.detect_shader_aovs"
-    bl_label = "Detectar AOVs nos Shaders"
-    bl_description = "Detectar AOVs configurados nos shaders do projeto"
-    bl_options = {'REGISTER', 'UNDO'}
-    
-    def execute(self, context):
-        scene = context.scene
-        
-        # Limpar lista de AOVs detectados
         scene.detected_aovs.clear()
+        aov_info = detect_material_aovs()
         
-        # Detectar AOVs existentes nos materiais
-        aov_names = set()
-        aov_info = []
-        
-        # Percorrer todos os materiais
-        for material in bpy.data.materials:
-            if material.use_nodes:
-                # Encontrar nós de saída AOV
-                for node in material.node_tree.nodes:
-                    if node.type == 'OUTPUT_AOV':
-                        aov_name = node.name
-                        if aov_name.startswith("AOV "):
-                            aov_name = aov_name[4:]  # Remover o prefixo "AOV "
-                        
-                        # Determinar o tipo de AOV com base nas conexões
-                        aov_type = 'COLOR'  # Padrão para color
-                        if node.inputs and node.inputs[0].links:
-                            socket_type = node.inputs[0].links[0].from_socket.type
-                            if socket_type == 'VALUE':
-                                aov_type = 'VALUE'
-                        
-                        aov_names.add(aov_name)
-                        
-                        # Adicionar à lista, evitando duplicatas
-                        if not any(info['name'] == aov_name for info in aov_info):
-                            aov_info.append({
-                                'name': aov_name,
-                                'type': aov_type
-                            })
-        
-        # Adicionar AOVs detectados à lista para interface
+        if len(aov_info) == 0:
+            self.report({"INFO"}, "Nenhum AOV encontrado nos materiais do projeto.")
+            return {"FINISHED"}
+            
+        # Adicionar AOVs encontrados à lista
         for info in aov_info:
             item = scene.detected_aovs.add()
-            item.name = info['name']
-            item.type = info['type']
-            item.use = True
-        
-        # Exibir informações sobre os AOVs encontrados
-        if aov_names:
-            self.report({'INFO'}, f"Encontrados {len(aov_names)} AOVs nos materiais: {', '.join(aov_names)}")
-        else:
-            self.report({'INFO'}, "Nenhum AOV encontrado nos materiais.")
+            item.name = info["name"]
+            item.type = info["type"]
+            item.selected = True  # Por padrão, todos vêm marcados
             
-        return {'FINISHED'}
+        # Essa linha estava causando o erro - removemos porque a propriedade agora está registrada corretamente
+        # scene.active_aov_index = bpy.props.IntProperty(default=0)
+            
+        self.report({"INFO"}, f"{len(aov_info)} AOVs detectados e listados.")
+        return {"FINISHED"}
 
 
-# Função auxiliar para filtrar coleções
-def get_filtered_collections(scene, props):
-    filter_text = props.collection_filter
-    case_sensitive = props.filter_case_sensitive
-    
-    if not filter_text:
-        # Se não houver filtro, retornar todas as coleções
-        return [item.name for item in scene.collection_selection]
-    
-    # Aplicar filtro
-    if case_sensitive:
-        return [item.name for item in scene.collection_selection 
-                if filter_text in item.name]
-    else:
-        filter_text = filter_text.lower()
-        return [item.name for item in scene.collection_selection 
-                if filter_text in item.name.lower()]
-
-
-# Operador para criar viewlayers
 class VIEWLAYER_OT_generate(Operator):
+    """Gerar viewlayers a partir das collections selecionadas."""
     bl_idname = "viewlayer.generate"
     bl_label = "Gerar ViewLayers"
-    bl_description = "Gerar viewlayers a partir das collections selecionadas"
-    bl_options = {'REGISTER', 'UNDO'}
+    bl_options = {"REGISTER", "UNDO"}
+    
+    def get_parent_collection(self, collection_name):
+        """Obter a collection pai de uma collection."""
+        # Percorrer todas as collections para encontrar a pai da collection atual
+        for parent in bpy.data.collections:
+            for child in parent.children:
+                if child.name == collection_name:
+                    return parent.name
+        return None
+
+    def process_layer_collection(self, layer_collection, collection_name, lighting_collections, always_active_collections, holdout_collections, holdout_parents, parent_active=False):
+        """Processar recursivamente uma layer collection e suas filhas."""
+        should_activate = False
+        is_holdout = False
+        
+        # Verificar tratamento especial para viewlayers com sufixo .GP
+        is_gp_viewlayer = collection_name.endswith(".GP")
+        
+        # Verificar se esta collection deve ser ativada
+        if parent_active:
+            # Se o pai está ativo, esta collection também deve ser ativada (herança hierárquica)
+            should_activate = True
+        elif layer_collection.name == collection_name:
+            # É a collection principal que origina a view layer
+            should_activate = True
+        elif layer_collection.name in always_active_collections or layer_collection.name.endswith(".all"):
+            # É uma collection com sufixo .all
+            should_activate = True
+        elif layer_collection.name == "lgt.all" and not is_gp_viewlayer:
+            # É a collection lgt.all (desativar para GP)
+            should_activate = True
+        elif layer_collection.name.startswith("lgt."):
+            # É uma collection lgt. com especificação
+            if is_gp_viewlayer:
+                # Para viewlayers GP, nunca ativar collections lgt.*
+                should_activate = False
+            else:
+                # Extrair o prefixo após "lgt."
+                lgt_prefix = layer_collection.name.split(".")[1] if "." in layer_collection.name else ""
+                
+                # Se não tem prefixo específico, ativar em todas as view layers
+                if not lgt_prefix:
+                    should_activate = True
+                # Se tem prefixo específico, verificar se a view layer começa com esse prefixo
+                elif collection_name.startswith(lgt_prefix + "."):
+                    should_activate = True
+        elif layer_collection.name.endswith(".hdt"):
+            # É uma collection de holdout
+            parent_name = holdout_parents.get(layer_collection.name)
+            if parent_name == collection_name:
+                # Esta collection .hdt pertence à collection que estamos processando
+                should_activate = True
+                is_holdout = True
+                
+        # Verificação especial para collections de holdout
+        if layer_collection.name.endswith(".hdt"):
+            # Garantir que o holdout seja aplicado independentemente
+            is_holdout = True
+        
+        # Aplicar as configurações
+        if should_activate:
+            layer_collection.exclude = False
+            if is_holdout:
+                # Aplicar o holdout de forma explícita
+                layer_collection.holdout = True
+        else:
+            layer_collection.exclude = True
+            # Resetar a propriedade holdout quando a collection não está ativa
+            layer_collection.holdout = False
+            
+        # Processar collections filhas recursivamente, passando o status de ativação do pai
+        for child in layer_collection.children:
+            self.process_layer_collection(
+                child, 
+                collection_name, 
+                lighting_collections, 
+                always_active_collections, 
+                holdout_collections, 
+                holdout_parents, 
+                parent_active=should_activate  # Passa se o pai (esta collection) está ativo
+            )
+
+    def execute(self, context):
+        scene = context.scene
+        selected_collections = [item.name for item in scene.collection_selection if item.selected]
+        if not selected_collections:
+            self.report({"ERROR"}, "Nenhuma collection selecionada!")
+            return {"CANCELLED"}
+
+        # Identificar collections lgt. e collections com sufixos .all e .hdt
+        lighting_collections = [col.name for col in bpy.data.collections if col.name.startswith("lgt.")]
+        always_active_collections = [col.name for col in bpy.data.collections if col.name.endswith(".all")]
+        holdout_collections = [col.name for col in bpy.data.collections if col.name.endswith(".hdt")]
+        
+        # Criar um dicionário que mapeia cada collection .hdt para sua collection pai
+        holdout_parents = {}
+        for hdt_name in holdout_collections:
+            parent_name = self.get_parent_collection(hdt_name)
+            if parent_name:
+                holdout_parents[hdt_name] = parent_name
+        
+        # Obter passes selecionados
+        passes = [pass_item.name for pass_item in scene.viewlayer_generator_props.selected_passes if pass_item.selected]
+
+        for collection_name in selected_collections:
+            # Cria a view layer com o nome da collection
+            viewlayer_name = collection_name
+            viewlayer = scene.view_layers.get(viewlayer_name) or scene.view_layers.new(viewlayer_name)
+
+            # Configurar visibilidade das collections recursivamente
+            self.process_layer_collection(
+                viewlayer.layer_collection, 
+                collection_name, 
+                lighting_collections, 
+                always_active_collections, 
+                holdout_collections,
+                holdout_parents,
+                parent_active=False  # Inicia com parent_active=False para a raiz
+            )
+
+            # Configurar passes na view layer
+            # Tratamento especial para viewlayers com sufixo .GP
+            if is_gp_collection(collection_name):
+                # Desativar todos os passes primeiro
+                for attr in dir(viewlayer):
+                    if attr.startswith("use_pass_") and isinstance(getattr(viewlayer, attr), bool):
+                        setattr(viewlayer, attr, False)
+                
+                # Ativar apenas o passe combined
+                if hasattr(viewlayer, "use_pass_combined"):
+                    setattr(viewlayer, "use_pass_combined", True)
+            else:
+                # Para outros viewlayers, aplicar passes normalmente
+                for pass_name in passes:
+                    if hasattr(viewlayer, pass_name):
+                        setattr(viewlayer, pass_name, True)
+
+        # Relatório final
+        if any(col.endswith(".GP") for col in selected_collections):
+            self.report({"INFO"}, f"{len(selected_collections)} ViewLayers gerados (ViewLayers com .GP usam apenas passe combined e sem luzes).")
+        else:
+            self.report({"INFO"}, f"{len(selected_collections)} ViewLayers gerados com passes: {', '.join(passes)}.")
+        
+        return {"FINISHED"}
+
+
+class VIEWLAYER_OT_refresh_collections(Operator):
+    """Atualizar a lista de collections disponíveis."""
+    bl_idname = "viewlayer.refresh_collections"
+    bl_label = "Atualizar Collections"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        scene = context.scene
+        existing_selection = {item.name for item in scene.collection_selection if item.selected}
+        scene.collection_selection.clear()  # Limpar a lista existente
+
+        # Preencher com as collections do projeto
+        for collection in bpy.data.collections:
+            item = scene.collection_selection.add()
+            # Manter seleção existente ou pré-selecionar collections com sufixo .vl
+            item.name = collection.name
+            item.selected = collection.name in existing_selection or collection.name.endswith(".vl")
+
+        self.report({"INFO"}, f"{len(scene.collection_selection)} collections carregadas.")
+        return {"FINISHED"}
+
+
+class VIEWLAYER_OT_activate_lighting(Operator):
+    """Ativar collections de lighting (lgt)."""
+    bl_idname = "viewlayer.activate_lighting"
+    bl_label = "Ativar Lighting"
+    bl_options = {"REGISTER", "UNDO"}
+
+    collection_name: StringProperty()
+
+    def execute(self, context):
+        scene = context.scene
+        for item in scene.collection_selection:
+            if item.name.startswith("lgt.") and item.name == self.collection_name:
+                item.selected = True
+        self.report({"INFO"}, f"Lighting ativado para {self.collection_name}.")
+        return {"FINISHED"}
+
+
+class VIEWLAYER_OT_activate_holdout(Operator):
+    """Ativar collections de holdout (.hdt)."""
+    bl_idname = "viewlayer.activate_holdout"
+    bl_label = "Ativar Holdout"
+    bl_options = {"REGISTER", "UNDO"}
+
+    collection_name: StringProperty()
+
+    def execute(self, context):
+        scene = context.scene
+        for item in scene.collection_selection:
+            if item.name.endswith(".hdt") and item.name == self.collection_name:
+                item.selected = True
+        self.report({"INFO"}, f"Holdout ativado para {self.collection_name}.")
+        return {"FINISHED"}
+
+
+class VIEWLAYER_OT_toggle_passes(Operator):
+    """Alternar seleção de todos os passes."""
+    bl_idname = "viewlayer.toggle_passes"
+    bl_label = "Alternar Passes"
+    bl_options = {"REGISTER", "UNDO"}
+
+    select_all: BoolProperty(default=True)
+
+    def execute(self, context):
+        props = context.scene.viewlayer_generator_props
+        for pass_item in props.selected_passes:
+            pass_item.selected = self.select_all
+        return {"FINISHED"}
+
+
+# ==========================
+# Operador para Refresh de Passes
+# ==========================
+class VIEWLAYER_OT_refresh_passes(Operator):
+    """Atualizar lista de passes de renderização disponíveis."""
+    bl_idname = "viewlayer.refresh_passes"
+    bl_label = "Atualizar Passes"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        scene = context.scene
+        props = scene.viewlayer_generator_props
+        
+        # Salvar seleção atual
+        existing_passes = {pass_item.name: pass_item.selected 
+                          for pass_item in props.selected_passes}
+        
+        # Limpar lista de passes
+        props.selected_passes.clear()
+        
+        # Obter passes disponíveis para o renderizador atual
+        available_passes = passes_data.get_passes_for_engine(scene.render.engine)
+        
+        # Adicionar passes à lista
+        for pass_name in available_passes:
+            # Verificar se a propriedade existe no view layer
+            if hasattr(context.view_layer, pass_name):
+                item = props.selected_passes.add()
+                item.name = pass_name
+                item.category = passes_data.get_pass_category(pass_name)
+                
+                # Manter seleção anterior se existir
+                item.selected = existing_passes.get(pass_name, False)
+        
+        self.report({"INFO"}, f"{len(props.selected_passes)} passes disponíveis para o renderizador {scene.render.engine}.")
+        return {"FINISHED"}
+
+
+class VIEWLAYER_OT_save_passes_prefs(Operator):
+    """Salvar configuração atual de passes como preferência"""
+    bl_idname = "viewlayer.save_passes_prefs"
+    bl_label = "Salvar Preferências de Passes"
+    bl_options = {"REGISTER", "UNDO"}
+    
+    engine: StringProperty(default="cycles")
+    
+    def execute(self, context):
+        props = context.scene.viewlayer_generator_props
+        preferences = context.preferences.addons[__name__].preferences
+        
+        # Limpar preferências existentes
+        target_collection = preferences.cycles_passes if self.engine == "cycles" else preferences.eevee_passes
+        target_collection.clear()
+        
+        # Copiar seleção atual para as preferências
+        for pass_item in props.selected_passes:
+            new_item = target_collection.add()
+            new_item.name = pass_item.name
+            new_item.selected = pass_item.selected
+            new_item.category = pass_item.category
+        
+        self.report({"INFO"}, f"Preferências de passes para {self.engine} salvas")
+        return {"FINISHED"}
+
+class VIEWLAYER_OT_load_passes_prefs(Operator):
+    """Carregar preferências de passes"""
+    bl_idname = "viewlayer.load_passes_prefs"
+    bl_label = "Carregar Preferências de Passes"
+    bl_options = {"REGISTER", "UNDO"}
+    
+    engine: StringProperty(default="cycles")
+    
+    def execute(self, context):
+        props = context.scene.viewlayer_generator_props
+        preferences = context.preferences.addons[__name__].preferences
+        
+        # Obter coleção de preferências
+        source_collection = preferences.cycles_passes if self.engine == "cycles" else preferences.eevee_passes
+        
+        # Aplicar preferências aos passes atuais
+        for pass_item in props.selected_passes:
+            for pref_item in source_collection:
+                if pass_item.name == pref_item.name:
+                    pass_item.selected = pref_item.selected
+                    break
+        
+        self.report({"INFO"}, f"Preferências de passes para {self.engine} aplicadas")
+        return {"FINISHED"}
+
+
+# Operador para executar todas as etapas
+class VIEWLAYER_OT_generate_all(Operator):
+    """Gerar ViewLayers completos (todas as etapas)"""
+    bl_idname = "viewlayer.generate_all"
+    bl_label = "Gerar ViewLayers Completos"
+    bl_options = {"REGISTER", "UNDO"}
+    
+    def execute(self, context):
+        # Etapa 1: Gerar ViewLayers
+        bpy.ops.viewlayer.generate_layers()
+        
+        # Etapa 2: Aplicar Passes
+        bpy.ops.viewlayer.apply_passes()
+        
+        # Etapa 3: Aplicar AOVs
+        bpy.ops.viewlayer.apply_aovs()
+        
+        self.report({"INFO"}, "Processo completo finalizado com sucesso")
+        return {"FINISHED"}
+
+
+# Operador para Etapa 1: Gerar apenas as ViewLayers
+class VIEWLAYER_OT_generate_layers(Operator):
+    """Gerar apenas as ViewLayers a partir das collections selecionadas"""
+    bl_idname = "viewlayer.generate_layers"
+    bl_label = "Gerar ViewLayers"
+    bl_options = {"REGISTER", "UNDO"}
+    
+    def get_parent_collection(self, collection_name):
+        """Obter a collection pai de uma collection."""
+        for parent in bpy.data.collections:
+            for child in parent.children:
+                if child.name == collection_name:
+                    return parent.name
+        return None
+
+    def process_layer_collection(self, layer_collection, collection_name, lighting_collections, always_active_collections, holdout_collections, holdout_parents, parent_active=False):
+        """Processar recursivamente uma layer collection e suas filhas."""
+        should_activate = False
+        is_holdout = False
+        
+        # Verificar tratamento especial para viewlayers com sufixo .GP
+        is_gp_viewlayer = collection_name.endswith(".GP.vl")
+        
+        # Verificações para determinar se a collection deve ser ativada
+        if parent_active:
+            should_activate = True
+        elif layer_collection.name == collection_name:
+            should_activate = True
+        elif layer_collection.name in always_active_collections or layer_collection.name.endswith(".all"):
+            should_activate = True
+        elif layer_collection.name == "lgt.all" and not is_gp_viewlayer:
+            # Para viewlayers GP, não ativar lgt.all
+            should_activate = True
+        elif layer_collection.name.startswith("lgt."):
+            # Para viewlayers GP, nunca ativar collections lgt.*
+            if is_gp_viewlayer:
+                should_activate = False
+            else:
+                # Lógica normal para outros viewlayers
+                lgt_prefix = layer_collection.name.split(".")[1] if "." in layer_collection.name else ""
+                if not lgt_prefix:
+                    should_activate = True
+                elif collection_name.startswith(lgt_prefix + "."):
+                    should_activate = True
+        elif layer_collection.name.endswith(".hdt"):
+            parent_name = holdout_parents.get(layer_collection.name)
+            if parent_name == collection_name:
+                should_activate = True
+                is_holdout = True
+                
+        if layer_collection.name.endswith(".hdt"):
+            is_holdout = True
+        
+        # Aplicar as configurações
+        if should_activate:
+            layer_collection.exclude = False
+            if is_holdout:
+                layer_collection.holdout = True
+        else:
+            layer_collection.exclude = True
+            layer_collection.holdout = False
+            
+        # Processar collections filhas recursivamente
+        for child in layer_collection.children:
+            self.process_layer_collection(
+                child, 
+                collection_name, 
+                lighting_collections, 
+                always_active_collections, 
+                holdout_collections, 
+                holdout_parents, 
+                parent_active=should_activate
+            )
+
+    def execute(self, context):
+        scene = context.scene
+        selected_collections = [item.name for item in scene.collection_selection if item.selected]
+        
+        if not selected_collections:
+            self.report({"ERROR"}, "Nenhuma collection selecionada!")
+            return {"CANCELLED"}
+
+        # Identificar collections lgt. e collections com sufixos .all e .hdt
+        lighting_collections = [col.name for col in bpy.data.collections if col.name.startswith("lgt.")]
+        always_active_collections = [col.name for col in bpy.data.collections if col.name.endswith(".all")]
+        holdout_collections = [col.name for col in bpy.data.collections if col.name.endswith(".hdt")]
+        
+        # Criar um dicionário que mapeia cada collection .hdt para sua collection pai
+        holdout_parents = {}
+        for hdt_name in holdout_collections:
+            parent_name = self.get_parent_collection(hdt_name)
+            if parent_name:
+                holdout_parents[hdt_name] = parent_name
+        
+        # Criar viewlayers
+        for collection_name in selected_collections:
+            # Cria a view layer com o nome da collection
+            viewlayer_name = collection_name
+            viewlayer = scene.view_layers.get(viewlayer_name) or scene.view_layers.new(viewlayer_name)
+
+            # Configurar visibilidade das collections recursivamente
+            self.process_layer_collection(
+                viewlayer.layer_collection, 
+                collection_name, 
+                lighting_collections, 
+                always_active_collections, 
+                holdout_collections,
+                holdout_parents,
+                parent_active=False
+            )
+            
+            # Verificar se é um viewlayer GP para aplicar apenas o passe combined
+            if is_gp_collection(collection_name):
+                # Desativar todos os passes primeiro
+                for attr in dir(viewlayer):
+                    if attr.startswith("use_pass_") and isinstance(getattr(viewlayer, attr), bool):
+                        setattr(viewlayer, attr, False)
+                
+                # Ativar apenas o passe combined
+                if hasattr(viewlayer, "use_pass_combined"):
+                    setattr(viewlayer, "use_pass_combined", True)
+
+        self.report({"INFO"}, f"{len(selected_collections)} ViewLayers gerados com sucesso!")
+        return {"FINISHED"}
+
+
+# Operador para Etapa 2: Aplicar apenas os Passes
+class VIEWLAYER_OT_apply_passes(Operator):
+    """Aplicar passes selecionados às ViewLayers existentes"""
+    bl_idname = "viewlayer.apply_passes"
+    bl_label = "Aplicar Passes"
+    bl_options = {"REGISTER", "UNDO"}
     
     def execute(self, context):
         scene = context.scene
         props = scene.viewlayer_generator_props
         
-        # Verificar se há collections selecionadas
-        selected_collections = [item.name for item in scene.collection_selection if item.selected]
-        if not selected_collections:
-            self.report({'ERROR'}, "Nenhuma collection selecionada!")
-            return {'CANCELLED'}
+        # Obter passes selecionados
+        passes = [pass_item.name for pass_item in props.selected_passes if pass_item.selected]
         
-        # Obter AOVs selecionados
-        selected_aovs = []
-        if props.detect_shader_aovs:
-            selected_aovs = [item for item in scene.detected_aovs if item.use]
+        if not passes:
+            self.report({"WARNING"}, "Nenhum passe selecionado!")
+            return {"CANCELLED"}
         
-        # Percorrer todas as collections selecionadas
-        for collection_name in selected_collections:
-            collection = bpy.data.collections.get(collection_name)
-            if not collection:
-                continue
-            
-            # Criar novo viewlayer
-            viewlayer_name = props.viewlayer_prefix + collection_name
-            
-            # Verificar se o viewlayer já existe
-            if viewlayer_name in context.scene.view_layers:
-                # Se existir, podemos atualizar ou pular
-                viewlayer = context.scene.view_layers[viewlayer_name]
+        # Aplicar passes a todas as view layers
+        count = 0
+        gp_count = 0
+        
+        for viewlayer in scene.view_layers:
+            # Verificar se é uma viewlayer GP (pelo nome)
+            if is_gp_collection(viewlayer.name):
+                # Para ViewLayers GP, aplicar apenas o passe combined
+                gp_count += 1
+                
+                # Desativar todos os passes primeiro
+                for attr in dir(viewlayer):
+                    if attr.startswith("use_pass_") and isinstance(getattr(viewlayer, attr), bool):
+                        setattr(viewlayer, attr, False)
+                
+                # Ativar apenas o passe combined
+                if hasattr(viewlayer, "use_pass_combined"):
+                    setattr(viewlayer, "use_pass_combined", True)
             else:
-                # Criar novo viewlayer
-                viewlayer = context.scene.view_layers.new(viewlayer_name)
+                # Para outras ViewLayers, aplicar os passes selecionados normalmente
+                for pass_name in passes:
+                    if hasattr(viewlayer, pass_name):
+                        setattr(viewlayer, pass_name, True)
             
-            # Configurar passes
-            viewlayer.use_pass_z = props.use_z
-            viewlayer.use_pass_mist = props.use_mist
-            viewlayer.use_pass_normal = props.use_normal
-            viewlayer.use_pass_vector = props.use_vector
-            viewlayer.use_pass_diffuse_direct = props.use_diffuse_direct
-            viewlayer.use_pass_diffuse_indirect = props.use_diffuse_indirect
-            viewlayer.use_pass_diffuse_color = props.use_diffuse_color
-            viewlayer.use_pass_glossy_direct = props.use_glossy_direct
-            viewlayer.use_pass_glossy_indirect = props.use_glossy_indirect
-            viewlayer.use_pass_glossy_color = props.use_glossy_color
-            viewlayer.use_pass_transmission_direct = props.use_transmission_direct
-            viewlayer.use_pass_transmission_indirect = props.use_transmission_indirect
-            viewlayer.use_pass_transmission_color = props.use_transmission_color
-            viewlayer.use_pass_emit = props.use_emit
-            viewlayer.use_pass_environment = props.use_environment
-            viewlayer.use_pass_shadow = props.use_shadow
-            viewlayer.use_pass_ambient_occlusion = props.use_ambient_occlusion
+            count += 1
+        
+        # Mensagem de feedback
+        if gp_count > 0:
+            self.report({"INFO"}, f"Passes aplicados a {count} ViewLayers ({gp_count} ViewLayers GP receberam apenas o passe combined)")
+        else:
+            self.report({"INFO"}, f"Passes aplicados com sucesso a {count} ViewLayers: {', '.join(passes)}")
             
-            # Configurar Cryptomatte (usando as configurações nativas do Blender)
-            if hasattr(viewlayer, "use_pass_cryptomatte"):
-                viewlayer.use_pass_cryptomatte = props.use_cryptomatte
-            
-            if hasattr(viewlayer, "use_pass_cryptomatte_accurate"):
-                viewlayer.use_pass_cryptomatte_accurate = props.use_cryptomatte_accurate
-            
-            if hasattr(viewlayer, "pass_cryptomatte_depth"):
-                viewlayer.pass_cryptomatte_depth = int(props.cryptomatte_levels)
-            
-            # Adicionar AOVs personalizados
-            self.add_custom_aovs(viewlayer, props, selected_aovs)
-            
-            # Configurar visibilidade das collections
-            self.setup_collection_visibility(viewlayer, collection_name)
-            
-            # Se opção ativada, conectar AOVs ao compositor
-            if props.apply_aovs_to_compositor and selected_aovs:
-                self.setup_compositor_nodes(context.scene, viewlayer, selected_aovs)
-        
-        self.report({'INFO'}, "ViewLayers gerados com sucesso!")
-        return {'FINISHED'}
-    
-    def add_custom_aovs(self, viewlayer, props, selected_aovs):
-        # Adicionar AOVs detectados nos shaders que foram selecionados
-        if props.detect_shader_aovs and selected_aovs:
-            for aov_item in selected_aovs:
-                self.add_aov(viewlayer, aov_item.name, aov_item.type)
-        
-        # Adicionar AOV personalizado 1 e 2 (se preenchidos)
-        if props.aov1_name:
-            self.add_aov(viewlayer, props.aov1_name, props.aov1_type)
-        
-        if props.aov2_name:
-            self.add_aov(viewlayer, props.aov2_name, props.aov2_type)
-    
-    def add_aov(self, viewlayer, name, aov_type):
-        # Verificar se o viewlayer tem o atributo 'aovs'
-        if not hasattr(viewlayer, "aovs"):
-            return
-        
-        # Verificar se o AOV já existe
-        for aov in viewlayer.aovs:
-            if aov.name == name:
-                aov.type = aov_type
-                return
-        
-        # Adicionar novo AOV
-        aov = viewlayer.aovs.add()
-        aov.name = name
-        aov.type = aov_type
-    
-    def setup_collection_visibility(self, viewlayer, target_collection_name):
-        # Função para configurar a visibilidade da collection no viewlayer
-        
-        # Função recursiva para encontrar a camada de collection
-        def find_layer_collection(layer_coll, collection_name):
-            if layer_coll.name == collection_name:
-                return layer_coll
-            for child in layer_coll.children:
-                result = find_layer_collection(child, collection_name)
-                if result:
-                    return result
-            return None
-        
-        # Começar a partir da camada de collection raiz
-        root = viewlayer.layer_collection
-        
-        # Ocultar todas as collections primeiro
-        for child in root.children:
-            child.exclude = True
-        
-        # Encontrar e mostrar a collection alvo
-        target = find_layer_collection(root, target_collection_name)
-        if target:
-            target.exclude = False
-    
-    def setup_compositor_nodes(self, scene, viewlayer, aovs):
-        """Configurar nós do compositor para utilizar os AOVs"""
-        
-        # Verificar se o compositor está ativo
-        scene.use_nodes = True
-        
-        # Obter a árvore de nós do compositor
-        if not scene.node_tree:
-            return
-        
-        nodes = scene.node_tree.nodes
-        links = scene.node_tree.links
-        
-        # Procurar ou criar nó de entrada Render Layers para este viewlayer
-        rl_node = None
-        for node in nodes:
-            if node.type == 'R_LAYERS' and node.layer == viewlayer.name:
-                rl_node = node
-                break
-        
-        if not rl_node:
-            # Criar nó de entrada Render Layers
-            rl_node = nodes.new(type='CompositorNodeRLayers')
-            rl_node.layer = viewlayer.name
-            rl_node.location = (-300, 0)
-        
-        # Procurar ou criar nó de saída File Output para AOVs
-        output_node = None
-        for node in nodes:
-            if node.type == 'OUTPUT_FILE' and node.name == f"AOV_Output_{viewlayer.name}":
-                output_node = node
-                break
-        
-        if not output_node:
-            # Criar nó de saída File Output
-            output_node = nodes.new(type='CompositorNodeOutputFile')
-            output_node.name = f"AOV_Output_{viewlayer.name}"
-            output_node.label = f"AOVs de {viewlayer.name}"
-            output_node.location = (300, 0)
-            output_node.base_path = "//renders/aovs/"
-        
-        # Limpar slots existentes no nó de saída
-        while len(output_node.file_slots) > 0:
-            output_node.file_slots.remove(output_node.file_slots[0])
-        
-        # Adicionar slots para cada AOV e conectar
-        for i, aov in enumerate(aovs):
-            # Adicionar slot de saída
-            if i > 0:  # O primeiro slot já existe
-                output_node.file_slots.new(aov.name)
-            else:
-                output_node.file_slots[0].path = aov.name
-            
-            # Tentar conectar o socket de saída do AOV
-            aov_socket = None
-            for socket in rl_node.outputs:
-                if socket.name == aov.name:
-                    aov_socket = socket
-                    break
-            
-            if aov_socket:
-                links.new(aov_socket, output_node.inputs[i])
+        return {"FINISHED"}
 
 
-# Operador para atualizar a lista de collections
-class VIEWLAYER_OT_update_collections(Operator):
-    bl_idname = "viewlayer.update_collections"
-    bl_label = "Atualizar Collections"
-    bl_description = "Atualizar a lista de collections disponíveis"
-    bl_options = {'REGISTER', 'UNDO'}
+# Operador para Etapa 3: Aplicar apenas os AOVs
+class VIEWLAYER_OT_apply_aovs(Operator):
+    """Aplicar AOVs detectados às ViewLayers existentes"""
+    bl_idname = "viewlayer.apply_aovs"
+    bl_label = "Aplicar AOVs"
+    bl_options = {"REGISTER", "UNDO"}
     
     def execute(self, context):
         scene = context.scene
         
-        # Limpar a lista de collections
-        scene.collection_selection.clear()
+        bpy.ops.viewlayer.detect_aovs()
         
-        # Adicionar todas as collections disponíveis
-        for collection in bpy.data.collections:
-            if collection.name not in scene.collection_selection:
-                item = scene.collection_selection.add()
-                item.name = collection.name
-                item.selected = False
+        # Obter AOVs selecionados
+        selected_aovs = [{"name": item.name, "type": getattr(item, "type", "COLOR")} 
+                         for item in scene.detected_aovs if getattr(item, "selected", True)]
         
-        if len(scene.collection_selection) == 0:
-            self.report({'WARNING'}, "Nenhuma collection encontrada!")
-        else:
-            self.report({'INFO'}, f"{len(scene.collection_selection)} collections encontradas!")
+        if not selected_aovs:
+            self.report({"WARNING"}, "Nenhum AOV selecionado!")
+            return {"CANCELLED"}
         
-        return {'FINISHED'}
+        # Aplicar AOVs a todas as view layers
+        count = 0
+        for viewlayer in scene.view_layers:
+            apply_aovs_to_viewlayer(viewlayer, selected_aovs)
+            count += 1
+        
+        aov_names = ", ".join(aov["name"] for aov in selected_aovs)
+        self.report({"INFO"}, f"AOVs aplicados com sucesso a {count} ViewLayers: {aov_names}")
+        return {"FINISHED"}
 
+
+# ==========================
+# Painéis
+# ==========================
 
 # Painel principal
 class VIEWLAYER_PT_panel(Panel):
     bl_label = "Gerador de ViewLayers"
     bl_idname = "VIEWLAYER_PT_panel"
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'UI'
-    bl_category = 'View Layer Generator'
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "View Layer Generator"
+    
+    def draw(self, context):
+        layout = self.layout
+        
+        # Botão principal (executa todas as etapas)
+        box = layout.box()
+        col = box.column(align=True)
+        col.label(text="Executar todas as etapas:", icon="PLAY")
+        col.operator("viewlayer.generate_all", text="Gerar ViewLayers Completos", icon="RENDERLAYERS")
+
+
+# Subpainel de Collections (Etapa 1)
+class VIEWLAYER_PT_collections_panel(Panel):
+    bl_label = "Gerar ViewLayers"
+    bl_idname = "VIEWLAYER_PT_collections_panel"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "View Layer Generator"
+    bl_parent_id = "VIEWLAYER_PT_panel"
+    bl_options = {"DEFAULT_CLOSED"}
+    
+    def draw(self, context):
+        layout = self.layout
+        scene = context.scene
+        
+        # Botão de execução e atualizar como ícone pequeno
+        row = layout.row(align=True)
+        row.operator("viewlayer.generate_layers", text="Gerar ViewLayers", icon="OUTLINER_OB_GROUP_INSTANCE")
+        row.operator("viewlayer.refresh_collections", text="", icon="FILE_REFRESH")
+        
+        # Lista de collections
+        layout.template_list(
+            "VIEWLAYER_UL_collections", "", 
+            scene, "collection_selection",
+            scene, "active_collection_index", rows=5
+        )
+
+
+# Subpainel de Passes (Etapa 2)
+class VIEWLAYER_PT_passes_panel(Panel):
+    bl_label = "Configurar Passes"
+    bl_idname = "VIEWLAYER_PT_passes_panel"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "View Layer Generator"
+    bl_parent_id = "VIEWLAYER_PT_panel"
+    bl_options = {"DEFAULT_CLOSED"}
     
     def draw(self, context):
         layout = self.layout
         scene = context.scene
         props = scene.viewlayer_generator_props
         
-        # Botão para atualizar a lista de collections
-        layout.operator("viewlayer.update_collections", icon='FILE_REFRESH')
-        
-        # Filtro de collections
+        # Botão de execução desta etapa
         box = layout.box()
-        box.label(text="Filtrar Collections:")
-        row = box.row(align=True)
-        row.prop(props, "collection_filter", text="")
-        row.prop(props, "filter_case_sensitive", text="", icon='TEXT')
+        box.operator("viewlayer.apply_passes", text="Aplicar Passes Selecionados", icon="RENDERLAYERS")
         
-        # Botões para selecionar/desselecionar todas
-        row = box.row(align=True)
-        row.operator("viewlayer.select_all_collections", icon='CHECKBOX_HLT')
-        row.operator("viewlayer.deselect_all_collections", icon='CHECKBOX_DEHLT')
+        # Categorias
+        row = layout.row()
+        row.label(text="Categorias:")
+        row = layout.row(align=True)
+        row.prop(props, "show_data_passes", toggle=True)
+        row.prop(props, "show_light_passes", toggle=True)
+        row.prop(props, "show_crypto_passes", toggle=True)
         
-        # Adicionar propriedade para controlar o estado do dropdown
-        if not hasattr(props, "show_collections"):
-            # Adicionaremos a propriedade na classe ViewLayerGeneratorProps mais tarde
-            box.label(text="Propriedade 'show_collections' não encontrada.")
+        # Lista de passes
+        if len(props.selected_passes) > 0:
+            layout.template_list(
+                "VIEWLAYER_UL_passes", "",
+                props, "selected_passes",
+                props, "active_pass_index", rows=5
+            )
         else:
-            # Seção de seleção de collections com dropdown
-            collection_box = layout.box()
-            row = collection_box.row()
-            row.prop(props, "show_collections", 
-                     icon='TRIA_DOWN' if props.show_collections else 'TRIA_RIGHT',
-                     icon_only=True, emboss=False)
-            row.label(text=f"Collections ({len([i for i in scene.collection_selection if i.selected])}/{len(scene.collection_selection)} selecionadas)")
-            
-            # Mostrar collections apenas se o dropdown estiver expandido
-            if props.show_collections:
-                if len(scene.collection_selection) == 0:
-                    collection_box.label(text="Nenhuma collection encontrada.")
-                    collection_box.label(text="Clique em 'Atualizar Collections'.")
-                else:
-                    # Filtrar collections
-                    filtered_collections = get_filtered_collections(scene, props)
-                    
-                    if filtered_collections:
-                        scroll_area = collection_box.box()
-                        scroll_area.template_list("VIEWLAYER_UL_collections", "", scene, "collection_selection", 
-                                                 props, "active_collection_index", rows=5)
-                        
-                        # Exibir também a lista clicável para manter a funcionalidade original
-                        col = collection_box.column()
-                        for item_name in filtered_collections:
-                            item = scene.collection_selection[item_name]
-                            row = col.row()
-                            icon = 'CHECKBOX_HLT' if item.selected else 'CHECKBOX_DEHLT'
-                            row.operator("viewlayer.toggle_collection", 
-                                        text=item.name, 
-                                        icon=icon).collection_name = item.name
-                    else:
-                        collection_box.label(text="Nenhuma collection corresponde ao filtro.")
+            # O botão de atualizar passou a ser automático
+            layout.label(text="Nenhum passe disponível")
         
-        # Prefixo para os nomes dos viewlayers
-        layout.prop(props, "viewlayer_prefix")
+        # Box para usar presets (movido para depois da lista)
+        engine = scene.render.engine.lower().replace('blender_', '')
+        engine_name = "Cycles" if engine == "cycles" else "Eevee"
         
-        # Botão de geração
-        layout.operator("viewlayer.generate", icon='RENDERLAYERS')
-
-class VIEWLAYER_UL_collections(bpy.types.UIList):
-    def draw_item(self, context, layout, data, item, icon, active_data, active_propname):
-        if self.layout_type in {'DEFAULT', 'COMPACT'}:
-            row = layout.row()
-            row.prop(item, "selected", text="")
-            row.label(text=item.name)
-        elif self.layout_type in {'GRID'}:
-            layout.alignment = 'CENTER'
-            layout.prop(item, "selected", text="")
+        # Botão para aplicar o preset do renderizador atual
+        op = layout.operator(
+            "viewlayer.load_passes_prefs", 
+            text=f"Aplicar Preset {engine_name}", 
+            icon="PRESET"
+        )
+        op.engine = engine
 
 
-# Painel para configuração de passes
-class VIEWLAYER_PT_passes(Panel):
-    bl_label = "Passes"
-    bl_idname = "VIEWLAYER_PT_passes"
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'UI'
-    bl_category = 'View Layer Generator'
+# Novo Subpainel de AOVs (Etapa 3)
+class VIEWLAYER_PT_aovs_panel(Panel):
+    bl_label = "Configurar AOVs"
+    bl_idname = "VIEWLAYER_PT_aovs_panel"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "View Layer Generator"
     bl_parent_id = "VIEWLAYER_PT_panel"
-    bl_options = {'DEFAULT_CLOSED'}
-    
-    def draw(self, context):
-        layout = self.layout
-        props = context.scene.viewlayer_generator_props
-        
-        # Adicionar passes em colunas para melhor organização
-        col = layout.column(align=True)
-        row = col.row()
-        row.prop(props, "use_z")
-        row.prop(props, "use_mist")
-        
-        row = col.row()
-        row.prop(props, "use_normal")
-        row.prop(props, "use_vector")
-        
-        col.separator()
-        col.label(text="Diffuse:")
-        row = col.row()
-        row.prop(props, "use_diffuse_direct")
-        row.prop(props, "use_diffuse_indirect")
-        row = col.row()
-        row.prop(props, "use_diffuse_color")
-        
-        col.separator()
-        col.label(text="Glossy:")
-        row = col.row()
-        row.prop(props, "use_glossy_direct")
-        row.prop(props, "use_glossy_indirect")
-        row = col.row()
-        row.prop(props, "use_glossy_color")
-        
-        col.separator()
-        col.label(text="Transmission:")
-        row = col.row()
-        row.prop(props, "use_transmission_direct")
-        row.prop(props, "use_transmission_indirect")
-        row = col.row()
-        row.prop(props, "use_transmission_color")
-        
-        col.separator()
-        row = col.row()
-        row.prop(props, "use_emit")
-        row.prop(props, "use_environment")
-        
-        row = col.row()
-        row = col.row()
-        row.prop(props, "use_shadow")
-        row.prop(props, "use_ambient_occlusion")
-
-
-# Painel para configuração de AOVs
-# Modificação no painel VIEWLAYER_PT_aovs para adicionar o novo botão
-class VIEWLAYER_PT_aovs(Panel):
-    bl_label = "AOVs"
-    bl_idname = "VIEWLAYER_PT_aovs"
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'UI'
-    bl_category = 'View Layer Generator'
-    bl_parent_id = "VIEWLAYER_PT_panel"
-    bl_options = {'DEFAULT_CLOSED'}
+    bl_options = {"DEFAULT_CLOSED"}
     
     def draw(self, context):
         layout = self.layout
         scene = context.scene
-        props = scene.viewlayer_generator_props
         
-        # Cryptomatte
-        box = layout.box()
-        box.label(text="Cryptomatte:")
-        box.prop(props, "use_cryptomatte")
+        # Botão de detecção e aplicação de AOVs
+        row = layout.row()
+        row.operator("viewlayer.detect_aovs", text="Detectar AOVs", icon="VIEWZOOM")
+        row.operator("viewlayer.apply_aovs", text="Aplicar AOVs", icon="MATERIAL")
         
-        # Mostrar opções adicionais apenas se Cryptomatte estiver ativado
-        if props.use_cryptomatte:
-            box.prop(props, "use_cryptomatte_accurate")
-            box.prop(props, "cryptomatte_levels")
-        
-        # AOVs dos shaders
-        box = layout.box()
-        row = box.row()
-        row.prop(props, "detect_shader_aovs")
-        row.operator("viewlayer.detect_shader_aovs", text="", icon='VIEWZOOM')
-        
-        # Nova opção para aplicar AOVs ao compositor
-        row = box.row()
-        row.prop(props, "apply_aovs_to_compositor")
-        
-        # *** NOVO BOTÃO PARA GERAR E APLICAR AOVs ***
-        row = box.row()
-        row.operator("viewlayer.generate_apply_aovs", icon='SHADERFX')
+        # Removi a seção de presets que estava aqui, pois já existe na seção de passes
         
         # Lista de AOVs detectados
         if len(scene.detected_aovs) > 0:
-            box.label(text="AOVs Detectados:")
-            for i, aov in enumerate(scene.detected_aovs):
+            box = layout.box()
+            box.label(text="AOVs Detectados:", icon="MATERIAL")
+            
+            # Exibir tipo e nome
+            for idx, item in enumerate(scene.detected_aovs):
                 row = box.row()
-                icon = 'CHECKBOX_HLT' if aov.use else 'CHECKBOX_DEHLT'
-                op = row.operator("viewlayer.toggle_aov", 
-                            text=f"{aov.name} ({aov.type})", 
-                            icon=icon)
-                op.aov_index = str(i)
-        
-        # AOVs personalizados
-        box = layout.box()
-        box.label(text="AOVs Personalizados:")
-        
-        # AOV 1
-        row = box.row()
-        row.prop(props, "aov1_name")
-        row.prop(props, "aov1_type")
-        
-        # AOV 2
-        row = box.row()
-        row.prop(props, "aov2_name")
-        row.prop(props, "aov2_type")
+                row.prop(item, "selected", text="")
+                row.label(text=item.name)
+                row.label(text=f"Tipo: {getattr(item, 'type', 'COLOR')}")
+        else:
+            layout.label(text="Nenhum AOV detectado. Clique em 'Detectar AOVs' para buscar")
 
-# Atualizar lista de classes para incluir os novos operadores e painel
-# Registro de classes
+
+# ==========================
+# Registro
+# ==========================
+# Atualização das classes para registro - CORRIGIDO
+# ==========================
 classes = (
-    CollectionItem,
-    AOVItem,
-    ViewLayerGeneratorProps,
-    VIEWLAYER_OT_toggle_collection,
-    VIEWLAYER_OT_select_all_collections,
-    VIEWLAYER_OT_deselect_all_collections,
-    VIEWLAYER_OT_toggle_aov,
-    VIEWLAYER_OT_detect_shader_aovs,
-    VIEWLAYER_OT_generate,
-    VIEWLAYER_OT_update_collections,
-    VIEWLAYER_OT_export_config,
-    VIEWLAYER_OT_import_config,
-    VIEWLAYER_OT_generate_apply_aovs,  # Novo operador
+    # UIs
     VIEWLAYER_UL_collections,
+    VIEWLAYER_UL_passes,
+    VIEWLAYER_UL_aovs,
+    
+    # Operadores principais
+    VIEWLAYER_OT_generate_all,
+    VIEWLAYER_OT_generate_layers,
+    VIEWLAYER_OT_apply_passes,
+    VIEWLAYER_OT_apply_aovs,
+    
+    # Operadores auxiliares
+    VIEWLAYER_OT_refresh_collections,
+    VIEWLAYER_OT_refresh_passes,
+    VIEWLAYER_OT_detect_aovs,
+    VIEWLAYER_OT_activate_lighting,
+    VIEWLAYER_OT_activate_holdout,
+    
+    # Adicionar os operadores de preferências aqui
+    VIEWLAYER_OT_load_passes_prefs,
+    VIEWLAYER_OT_save_passes_prefs,
+    
+    # Painéis
     VIEWLAYER_PT_panel,
-    VIEWLAYER_PT_passes,
-    VIEWLAYER_PT_aovs,
-    VIEWLAYER_PT_import_export,
+    VIEWLAYER_PT_collections_panel,
+    VIEWLAYER_PT_passes_panel,
+    VIEWLAYER_PT_aovs_panel,
 )
 
 def register():
+    # Imprimir informações de diagnóstico
+    print(f"Registrando addon: {__name__}")
+    print(f"Módulos carregados: {list(sys.modules.keys())}")
+    
+    # Registrar propriedades primeiro
+    register_properties()
+    
+    # Adicionar propriedade para index ativo de AOV
+    bpy.types.Scene.active_aov_index = bpy.props.IntProperty(default=0)
+    
+    # Registrar classes deste arquivo
     for cls in classes:
         bpy.utils.register_class(cls)
-    bpy.types.Scene.viewlayer_generator_props = PointerProperty(type=ViewLayerGeneratorProps)
-    bpy.types.Scene.collection_selection = CollectionProperty(type=CollectionItem)
-    bpy.types.Scene.detected_aovs = CollectionProperty(type=AOVItem)
+    
+    # Registrar preferências por último
+    register_preferences(__name__)
+    
+    # Inicializar preferências com tratamento de erro
+    try:
+        # Listar todos os addons disponíveis para diagnóstico
+        print("Addons disponíveis:")
+        for addon_name in bpy.context.preferences.addons.keys():
+            print(f"  - {addon_name}")
+            
+        # Inicializar preferências usando o método alternativo
+        for addon_name in bpy.context.preferences.addons.keys():
+            preferences = bpy.context.preferences.addons[addon_name].preferences
+            if hasattr(preferences, "cycles_passes"):
+                print(f"Inicializando preferências para addon: {addon_name}")
+                
+                # Inicializar passes predefinidos
+                if len(preferences.cycles_passes) == 0:
+                    initialize_default_passes(preferences.cycles_passes, "CYCLES")
+                
+                if len(preferences.eevee_passes) == 0:
+                    initialize_default_passes(preferences.eevee_passes, "BLENDER_EEVEE")
+                    
+                break
+    except Exception as e:
+        print(f"Erro ao inicializar preferências: {str(e)}")
+        import traceback
+        traceback.print_exc()
+    
+    # Registrar manipulador de eventos
+    bpy.app.handlers.depsgraph_update_post.append(update_passes_on_render_change)
+    
+    # Aplicar automaticamente o preset de passes
+    def apply_preset_callback():
+        try:
+            # Executar apenas uma vez após o carregamento completo da UI
+            bpy.ops.viewlayer.refresh_passes()
+            engine = bpy.context.scene.render.engine.lower().replace('blender_', '')
+            bpy.ops.viewlayer.load_passes_prefs(engine=engine)
+            print("Preset de passes aplicado automaticamente")
+        except Exception as e:
+            print(f"Erro ao aplicar preset automático: {str(e)}")
+        return None  # Não repetir o timer
+    
+    # Registrar o timer para executar em 0.5 segundos
+    bpy.app.timers.register(apply_preset_callback, first_interval=0.5)
 
+
+# Manipulador de eventos para atualizar passes quando o motor de renderização muda
+last_render_engine = None
+def update_passes_on_render_change(scene):
+    global last_render_engine
+    if scene.render.engine != last_render_engine:
+        last_render_engine = scene.render.engine
+        # Atualizar passes disponíveis baseados no novo motor
+        bpy.ops.viewlayer.refresh_passes()
+        
+        # Aplicar automaticamente o preset do novo motor
+        try:
+            engine = scene.render.engine.lower().replace('blender_', '')
+            bpy.ops.viewlayer.load_passes_prefs(engine=engine)
+            print(f"Preset de {engine} aplicado após mudança de renderizador")
+        except Exception as e:
+            print(f"Erro ao aplicar preset após mudança: {str(e)}")
+
+# No método unregister(), assegure que todas as classes são desregistradas
 def unregister():
+    # Primeiro tentar remover manipuladores de eventos (pode falhar se não estiverem registrados)
+    try:
+        bpy.app.handlers.depsgraph_update_post.remove(update_passes_on_render_change)
+    except ValueError:
+        print("Manipulador de eventos não encontrado ou já removido")
+    
+    # Limpar propriedades da cena
+    try:
+        del bpy.types.Scene.active_aov_index
+    except AttributeError:
+        pass
+    
+    # Cancelar registro das classes deste arquivo - com proteção contra erros
     for cls in reversed(classes):
-        bpy.utils.unregister_class(cls)
-    del bpy.types.Scene.viewlayer_generator_props
-    del bpy.types.Scene.collection_selection
-    del bpy.types.Scene.detected_aovs
+        try:
+            bpy.utils.unregister_class(cls)
+        except RuntimeError:
+            print(f"Aviso: Classe {cls.__name__} já estava desregistrada")
+    
+    # Cancelar registro de preferências
+    unregister_preferences()
+    
+    # Cancelar registro de propriedades
+    unregister_properties()
+
 
 if __name__ == "__main__":
     register()
