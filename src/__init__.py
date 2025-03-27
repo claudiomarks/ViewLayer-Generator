@@ -14,7 +14,7 @@ from .preferences import initialize_default_passes, register_preferences, unregi
 bl_info = {
     "name": "ViewLayer-Generator",
     "author": "histeria",
-    "version": (2, 2, 5),
+    "version": (2, 2, 6),
     "blender": (4, 3, 0),
     "location": "View3D > Sidebar > View Layer Generator",
     "description": "Gera viewlayers a partir de collections e configura passes e AOVs",
@@ -55,6 +55,19 @@ def is_gp_collection(collection_name):
 def is_lgt_collection(collection_name):
     """Verificar se uma collection é do tipo lgt."""
     return collection_name.startswith("lgt.")
+
+def apply_aovs_to_viewlayer(viewlayer, aov_info):
+    """Apply AOVs to a view layer."""
+    if not hasattr(viewlayer, "aovs"):
+        return
+    for aov_data in aov_info:
+        existing_aov = next((aov for aov in viewlayer.aovs if aov.name == aov_data["name"]), None)
+        if existing_aov:
+            existing_aov.type = aov_data["type"]
+        else:
+            new_aov = viewlayer.aovs.add()
+            new_aov.name = aov_data["name"]
+            new_aov.type = aov_data["type"]
 
 # ==========================
 # UIList para Collections
