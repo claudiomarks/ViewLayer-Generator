@@ -14,7 +14,7 @@ from .preferences import initialize_default_passes, register_preferences, unregi
 bl_info = {
     "name": "viewlayer_generator",
     "author": "histeria",
-    "version": (2, 2, 2),
+    "version": (2, 2, 3),
     "blender": (4, 3, 0),
     "location": "View3D > Sidebar > View Layer Generator",
     "description": "Gera viewlayers a partir de collections e configura passes e AOVs",
@@ -77,6 +77,10 @@ def apply_aovs_to_viewlayer(viewlayer, aov_info):
 def is_gp_collection(collection_name):
     """Verificar se uma collection é para Grease Pencil."""
     return collection_name.endswith(".GP") or collection_name.endswith(".GP.vl")
+
+def is_lgt_collection(collection_name):
+    """Verificar se uma collection é do tipo lgt."""
+    return collection_name.startswith("lgt.")
 
 # ==========================
 # UIList para Collections
@@ -331,9 +335,20 @@ class VIEWLAYER_OT_generate(Operator):
                     if attr.startswith("use_pass_") and isinstance(getattr(viewlayer, attr), bool):
                         setattr(viewlayer, attr, False)
                 
-                # Ativar apenas o passe combined
+                # Ativar apenas os passes combined e Z
                 if hasattr(viewlayer, "use_pass_combined"):
                     setattr(viewlayer, "use_pass_combined", True)
+                    setattr(viewlayer, "use_pass_z", True)
+            
+            elif is_lgt_collection(collection_name):
+                # Para viewlayers do tipo lgt, ativar apenas o passe combined
+                for attr in dir(viewlayer):
+                    if attr.startswith("use_pass_") and isinstance(getattr(viewlayer, attr), bool):
+                        setattr(viewlayer, attr, False)
+                
+                if hasattr(viewlayer, "use_pass_combined"):
+                    setattr(viewlayer, "use_pass_combined", True)
+            
             else:
                 # Para outros viewlayers, aplicar passes normalmente
                 for pass_name in passes:
@@ -519,9 +534,12 @@ class VIEWLAYER_OT_generate_all(Operator):
     
     def execute(self, context):
         # Etapa 1: Gerar ViewLayers
+        bpy.ops.viewlayer.refresh_collections()
         bpy.ops.viewlayer.generate_layers()
         
         # Etapa 2: Aplicar Passes
+        engine = context.scene.render.engine.lower().replace('blender_', '')
+        bpy.ops.viewlayer.load_passes_prefs(engine=engine)
         bpy.ops.viewlayer.apply_passes()
         
         # Etapa 3: Aplicar AOVs
@@ -533,6 +551,7 @@ class VIEWLAYER_OT_generate_all(Operator):
 
 # Operador para Etapa 1: Gerar apenas as ViewLayers
 class VIEWLAYER_OT_generate_layers(Operator):
+
     """Gerar apenas as ViewLayers a partir das collections selecionadas"""
     bl_idname = "viewlayer.generate_layers"
     bl_label = "Gerar ViewLayers"
@@ -652,6 +671,8 @@ class VIEWLAYER_OT_generate_layers(Operator):
                 # Ativar apenas o passe combined
                 if hasattr(viewlayer, "use_pass_combined"):
                     setattr(viewlayer, "use_pass_combined", True)
+                if hasattr(viewlayer, "use_pass_z"):
+                    setattr(viewlayer, "use_pass_z", True)
 
         self.report({"INFO"}, f"{len(selected_collections)} ViewLayers gerados com sucesso!")
         return {"FINISHED"}
@@ -693,6 +714,17 @@ class VIEWLAYER_OT_apply_passes(Operator):
                 # Ativar apenas o passe combined
                 if hasattr(viewlayer, "use_pass_combined"):
                     setattr(viewlayer, "use_pass_combined", True)
+                    setattr(viewlayer, "use_pass_z", True)
+
+            elif is_lgt_collection(viewlayer.name):
+                # Para viewlayers do tipo lgt, ativar apenas o passe combined
+                for attr in dir(viewlayer):
+                    if attr.startswith("use_pass_") and isinstance(getattr(viewlayer, attr), bool):
+                        setattr(viewlayer, attr, False)
+                
+                if hasattr(viewlayer, "use_pass_combined"):
+                    setattr(viewlayer, "use_pass_combined", True)
+                                 
             else:
                 # Para outras ViewLayers, aplicar os passes selecionados normalmente
                 for pass_name in passes:
@@ -733,6 +765,10 @@ class VIEWLAYER_OT_apply_aovs(Operator):
         # Aplicar AOVs a todas as view layers
         count = 0
         for viewlayer in scene.view_layers:
+            # Verificar se é uma viewlayer GP (pelo nome)
+            if is_gp_collection(viewlayer.name) or is_lgt_collection(viewlayer.name):
+                continue  # Pular view layers do tipo GP
+            
             apply_aovs_to_viewlayer(viewlayer, selected_aovs)
             count += 1
         
