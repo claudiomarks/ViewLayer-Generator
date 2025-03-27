@@ -159,15 +159,15 @@ class VIEWLAYER_OT_reset_passes_prefs(Operator):
             # Resetar a coleção apropriada
             target_collection = preferences.cycles_passes if self.engine == "cycles" else preferences.eevee_passes
             
-            # Redefinir todos os passes para o padrão (apenas combined e z selecionados)
+            # Redefinir todos os passes para o padrão (todos selecionados)
             for pass_item in target_collection:
-                pass_item.selected = pass_item.name in ["use_pass_combined", "use_pass_z"]
+                pass_item.selected = True
             
             # Atualizar os passes também na seleção atual se ela existir
             props = context.scene.viewlayer_generator_props
             if hasattr(props, "selected_passes"):
                 for pass_item in props.selected_passes:
-                    pass_item.selected = pass_item.name in ["use_pass_combined", "use_pass_z"]
+                    pass_item.selected = True
             
             engine_name = "Cycles" if self.engine == "cycles" else "Eevee"
             self.report({"INFO"}, f"Passes de {engine_name} restaurados para configuração padrão")
@@ -291,8 +291,8 @@ def initialize_default_passes(collection, engine_name):
             item = collection.add()
             item.name = pass_name
             item.category = passes_data.get_pass_category(pass_name)
-            # Por padrão, apenas Combined e Z são selecionados
-            item.selected = pass_name in ["use_pass_combined", "use_pass_z"]
+            # Por padrão, todos os passes são selecionados
+            item.selected = True
     except Exception as e:
         print(f"Erro ao inicializar passes padrão: {str(e)}")
 
